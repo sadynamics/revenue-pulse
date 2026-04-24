@@ -1,0 +1,25 @@
+{
+  "name": "revenue-pulse",
+  "version": "1.0.0",
+  "description": "RevenueCat-style real-time subscription analytics dashboard (MRR, churn, renewals, timeline).",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "seed": "node src/scripts/seed.js",
+    "simulate": "node src/scripts/simulate.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "compression": "^1.7.4",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "helmet": "^7.1.0",
+    "morgan": "^1.10.0",
+    "nanoid": "^5.0.7"
+  }
+}

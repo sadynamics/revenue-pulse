@@ -12,7 +12,7 @@
     "backfill": "node src/scripts/backfill.js"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": "22.x"
   },
   "dependencies": {
     "better-sqlite3": "^11.3.0",

@@ -1,15 +1,34 @@
 import Database from 'better-sqlite3';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, accessSync, constants } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
 const dbPath = resolve(process.env.DB_PATH || './data/revenue.db');
-mkdirSync(dirname(dbPath), { recursive: true });
+const dbDir = dirname(dbPath);
 
-export const db = new Database(dbPath);
+console.log(`[db] opening database at ${dbPath}`);
+
+try {
+  mkdirSync(dbDir, { recursive: true });
+  accessSync(dbDir, constants.R_OK | constants.W_OK);
+} catch (err) {
+  console.error(`[db] cannot prepare directory ${dbDir}:`, err.message);
+  console.error('[db] hint: make sure the Railway volume mount path matches DB_PATH, and set RAILWAY_RUN_UID=0 if your container runs as a non-root user.');
+  throw err;
+}
+
+let db;
+try {
+  db = new Database(dbPath);
+} catch (err) {
+  console.error(`[db] failed to open sqlite file at ${dbPath}:`, err.message);
+  throw err;
+}
 
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 db.pragma('synchronous = NORMAL');
+
+export { db };
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS events (

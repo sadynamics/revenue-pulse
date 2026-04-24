@@ -38,7 +38,7 @@ function decodeJwsHeader(jws) {
   return JSON.parse(b64urlDecode(h).toString('utf8'));
 }
 
-function decodeJwsPayload(jws) {
+export function decodeJwsPayload(jws) {
   const [, p] = jws.split('.');
   return JSON.parse(b64urlDecode(p).toString('utf8'));
 }

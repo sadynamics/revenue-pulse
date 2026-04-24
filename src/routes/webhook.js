@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { readFileSync, existsSync } from 'node:fs';
 import { processEvent } from '../services/events.js';
 import { decodeNotification, mapNotification } from '../services/appstore.js';
+import { maybeBackfillInBackground } from '../services/backfill.js';
 
 export const webhook = Router();
 
@@ -48,9 +49,22 @@ function handleAppleNotification(signedPayload, { verify }) {
 
   const internal = mapNotification(decoded);
   const results = [];
+  let insertedCount = 0;
   for (const ev of internal) {
-    results.push(processEvent(ev));
+    const r = processEvent(ev);
+    results.push(r);
+    if (!r.duplicate) insertedCount++;
   }
+
+  // If this is the first time we've seen this Apple user, fetch their full purchase
+  // history (auto-renewable + non-renewing + lifetime + consumables) from the App
+  // Store Server API so the dashboard isn't blind to anything that happened before
+  // we deployed. Runs in the background; webhook responds 200 either way.
+  const otid = internal[0]?.original_transaction_id;
+  if (otid && insertedCount > 0) {
+    maybeBackfillInBackground(otid, insertedCount);
+  }
+
   return { decoded, results };
 }
 

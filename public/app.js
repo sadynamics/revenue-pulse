@@ -462,7 +462,30 @@ async function renderGeography() {
 async function renderDebug() {
   setTitle('Webhook Debug', 'Test App Store Server Notifications V2 integration');
 
+  const cfg = await api('/config').catch(() => ({}));
+
   $('#page').innerHTML = `
+    <section class="card mb-6">
+      <div class="flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <h3 class="font-semibold mb-1">App Store Server API</h3>
+          <div class="text-xs text-ink-400">
+            ${cfg.appstore_api_configured
+              ? `<span class="text-emerald-400">●</span> Configured · ${cfg.environment || 'Production'} · ${cfg.bundle_id || ''}`
+              : `<span class="text-rose-400">●</span> Not configured — set APPSTORE_ISSUER_ID, APPSTORE_KEY_ID, APPSTORE_PRIVATE_KEY[_PATH], APPSTORE_BUNDLE_ID`}
+          </div>
+          <div class="text-xs text-ink-400 mt-2">
+            Used to backfill historical purchases (renewals, refunds, lifetime, consumables) for users seen via webhook.
+            New users are auto-backfilled in the background. You can also trigger a sync per-user from the Subscribers list, or backfill everything via <code>npm run backfill</code>.
+          </div>
+        </div>
+        <button id="backfill-all-btn" class="btn-ghost text-sm" ${cfg.appstore_api_configured ? '' : 'disabled'} title="Backfill every user currently in the DB">
+          🔁 Backfill all users
+        </button>
+      </div>
+      <div id="backfill-status" class="hidden mt-3 text-sm"></div>
+    </section>
+
     <section class="grid grid-cols-1 xl:grid-cols-2 gap-6">
       <div class="card">
         <h3 class="font-semibold mb-3">Webhook endpoint</h3>
@@ -497,6 +520,37 @@ async function renderDebug() {
       <div id="debug-list"></div>
     </section>
   `;
+
+  const backfillBtn = $('#backfill-all-btn');
+  if (backfillBtn) {
+    backfillBtn.addEventListener('click', async () => {
+      const status = $('#backfill-status');
+      status.classList.remove('hidden');
+      status.className = 'mt-3 text-sm text-ink-400';
+      status.textContent = 'Loading subscriber list…';
+
+      const list = await api('/subscribers?limit=200');
+      const items = list.items || [];
+      if (!items.length) { status.textContent = 'No subscribers to backfill.'; return; }
+
+      backfillBtn.disabled = true;
+      let fetched = 0, inserted = 0, skipped = 0, errors = 0;
+      for (let i = 0; i < items.length; i++) {
+        const u = items[i];
+        status.textContent = `Backfilling ${i + 1}/${items.length} · ${u.app_user_id} · inserted ${inserted}, skipped ${skipped}, errors ${errors}`;
+        try {
+          const r = await fetch(`/api/subscribers/${encodeURIComponent(u.app_user_id)}/sync`, {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+          }).then(res => res.json());
+          if (r.error) errors++;
+          else { fetched += r.fetched || 0; inserted += r.inserted || 0; skipped += r.skipped || 0; errors += r.errors || 0; }
+        } catch (e) { errors++; }
+      }
+      status.className = 'mt-3 text-sm text-emerald-400';
+      status.textContent = `✓ Done. Users ${items.length} · fetched ${fetched} · inserted ${inserted} · skipped ${skipped} · errors ${errors}.`;
+      backfillBtn.disabled = false;
+    });
+  }
 
   $$('[data-send]').forEach(btn => btn.addEventListener('click', async () => {
     const { type, subtype } = JSON.parse(btn.dataset.send);
@@ -566,12 +620,16 @@ window.showRawEvent = async (id) => {
 // ============================================================
 
 async function openSubscriber(id) {
-  const data = await api(`/subscribers/${encodeURIComponent(id)}`);
+  const [data, cfg] = await Promise.all([
+    api(`/subscribers/${encodeURIComponent(id)}`),
+    api('/config').catch(() => ({})),
+  ]);
   const s = data.subscriber;
+  const canSync = !!cfg.appstore_api_configured;
   $('#sub-modal').classList.remove('hidden');
   $('#sub-modal-body').innerHTML = `
-    <div class="flex items-start justify-between mb-6">
-      <div>
+    <div class="flex items-start justify-between mb-6 gap-4">
+      <div class="min-w-0">
         <div class="text-xs uppercase tracking-wide text-ink-400 mb-1">Subscriber</div>
         <div class="text-lg font-semibold font-mono break-all">${s.app_user_id}</div>
         <div class="mt-2 flex flex-wrap gap-2">
@@ -581,8 +639,15 @@ async function openSubscriber(id) {
           ${s.trial_converted ? '<span class="badge badge-ok">converted from trial</span>' : ''}
         </div>
       </div>
-      <button class="btn-ghost text-sm" onclick="document.getElementById('sub-modal').classList.add('hidden')">✕</button>
+      <div class="flex items-center gap-2 shrink-0">
+        ${canSync
+          ? `<button id="sub-sync-btn" class="btn-ghost text-sm" data-id="${encodeURIComponent(s.app_user_id)}" title="Pull this user's full purchase history from the App Store Server API">🔄 Sync from App Store</button>`
+          : `<span class="text-xs text-ink-400" title="Set APPSTORE_ISSUER_ID, APPSTORE_KEY_ID, APPSTORE_PRIVATE_KEY[_PATH], APPSTORE_BUNDLE_ID to enable">App Store API not configured</span>`
+        }
+        <button class="btn-ghost text-sm" onclick="document.getElementById('sub-modal').classList.add('hidden')">✕</button>
+      </div>
     </div>
+    <div id="sub-sync-status" class="hidden mb-4 text-sm"></div>
 
     <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
       ${kpiCard('LTV',          fmtMoney(s.ltv_usd))}
@@ -627,11 +692,39 @@ async function openSubscriber(id) {
   `;
 }
 
-document.addEventListener('click', (e) => {
+document.addEventListener('click', async (e) => {
   const row = e.target.closest('tr[data-user]');
   if (row) openSubscriber(row.dataset.user);
 
   if (e.target.id === 'sub-modal') $('#sub-modal').classList.add('hidden');
+
+  const syncBtn = e.target.closest('#sub-sync-btn');
+  if (syncBtn) {
+    const id = decodeURIComponent(syncBtn.dataset.id);
+    const status = $('#sub-sync-status');
+    syncBtn.disabled = true;
+    syncBtn.textContent = '⏳ Syncing…';
+    status.classList.remove('hidden');
+    status.className = 'mb-4 text-sm text-ink-400';
+    status.textContent = 'Pulling full transaction history from the App Store Server API…';
+    try {
+      const r = await fetch(`/api/subscribers/${encodeURIComponent(id)}/sync`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      }).then(res => res.json());
+      if (r.error) throw new Error(r.message || r.error);
+      status.className = 'mb-4 text-sm text-emerald-400';
+      status.textContent = `✓ Synced — fetched ${r.fetched}, inserted ${r.inserted}, skipped ${r.skipped}${r.errors ? `, errors ${r.errors}` : ''}.`;
+      // Refresh modal after a short delay
+      setTimeout(() => openSubscriber(id), 600);
+    } catch (err) {
+      status.className = 'mb-4 text-sm text-rose-400';
+      status.textContent = `✕ Sync failed: ${err.message}`;
+      syncBtn.disabled = false;
+      syncBtn.textContent = '🔄 Sync from App Store';
+    }
+  }
 });
 
 document.addEventListener('keydown', (e) => {

@@ -26,6 +26,7 @@ Webhook'lar JWS olarak gelir, imzası doğrulanır, içindeki `signedTransaction
 - **🔐 JWS signature verification** – x5c zinciri doğrulaması, opsiyonel Apple Root CA kontrolü
 - **📡 Idempotent ingest** – Aynı `notificationUUID` duplicate olarak işaretlenir
 - **🔁 Apple-spesifik alanlar** – `originalTransactionId`, `webOrderLineItemId`, `appAccountToken`
+- **📜 Transaction history backfill** – Yeni bir kullanıcı görüldüğünde, App Store Server API üzerinden tüm geçmiş satın alımları (yenilemeler, iade, lifetime, consumable) **otomatik** çekilir. Manuel "Sync from App Store" butonu ve `npm run backfill` da mevcut.
 
 ## Mimari
 
@@ -99,6 +100,59 @@ APPSTORE_SKIP_VERIFICATION=true
 
 Bu durumda sadece JWS decode edilir, imza doğrulanmaz. Prod'da **asla** açık olmamalı.
 
+## Transaction history backfill (App Store Server API)
+
+Webhook'lar **sadece olduğu anda gerçekleşen olayı** anlatır. Bir kullanıcı dashboard'a webhook ile geldiğinde, geçmişteki tüm satın alımlarını da görmek için Apple'ın **App Store Server API**'sine bağlanırız.
+
+Bu sayede:
+
+- Yeni bir abone webhook ile geldiğinde geçmiş tüm transaction'ları (lifetime, consumable, eski yenilemeler, eski iade'ler dahil) otomatik dolar.
+- Subscriber detay panelinde **🔄 Sync from App Store** butonu o kullanıcının geçmişini bir kez daha senkronlar.
+- Webhook Debug sayfasındaki **🔁 Backfill all users** butonu DB'deki tüm kullanıcıları toplu senkronlar.
+- `npm run backfill` ile sunucu tarafında aynı işlem yapılabilir (`-- --user <txId>` ile tek kullanıcı).
+
+### API Key oluşturma (1 dakika)
+
+1. https://appstoreconnect.apple.com → **Users and Access** → **Integrations** sekmesi.
+2. Sol menüden **In-App Purchase** → **Generate API Key (+)**.
+3. Bir isim ver, **Generate**'a bas.
+4. Listeden:
+   - **Key ID**'yi kopyala (10 karakterli kod).
+   - **Issuer ID**'yi kopyala (sayfanın üstünde, UUID).
+   - **Download API Key**'e basıp `.p8` dosyasını indir. **Bir kere indirilebilir, kaybedersen yeni key oluşturmak zorundasın.**
+
+### Environment variables
+
+```bash
+APPSTORE_ISSUER_ID=00000000-0000-0000-0000-000000000000
+APPSTORE_KEY_ID=ABCDEF1234
+
+# .p8 PEM içeriğini direkt env'e koy (Railway'de en kolayı):
+APPSTORE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nMIG...\n-----END PRIVATE KEY-----\n"
+
+# veya dosya yolu:
+# APPSTORE_PRIVATE_KEY_PATH=/app/certs/AuthKey_ABCDEF1234.p8
+```
+
+> Railway'de PEM string'i kopyalarken newline'ları `\n` literal olarak yaz; uygulama içinde tekrar satır sonlarına çevriliyor.
+
+Konfigüre edilmediği sürece:
+
+- Webhook'lar normal çalışır, **dashboard hiçbir geriye dönük veri görmez** — sadece deploy sonrası gelen event'ler işlenir.
+- Subscriber paneli **App Store API not configured** uyarısı gösterir.
+
+### Desteklenen transaction tipleri
+
+History endpoint'i tüm IAP tiplerini döner:
+
+- `Auto-Renewable Subscription` → `INITIAL_PURCHASE` veya `RENEWAL`
+- `Non-Renewing Subscription` → `NON_RENEWING_PURCHASE`
+- `Non-Consumable` (lifetime) → `NON_RENEWING_PURCHASE`
+- `Consumable` (örn. coin paketi) → `NON_RENEWING_PURCHASE`
+- `revocationDate` set ise → `REFUND`
+
+İdempotent: aynı `transactionId` zaten DB'de varsa atlanır. Aynı kullanıcıyı sürekli senkronlamak güvenlidir.
+
 ## Desteklenen Apple notification tipleri
 
 | Apple `notificationType` | `subtype` | İç event |
@@ -145,6 +199,9 @@ Bu durumda sadece JWS decode edilir, imza doğrulanmaz. Prod'da **asla** açık 
 | `POST /webhook`                   | Apple signedPayload kabul eder (JWS verify edilir) |
 | `POST /webhook/test`              | Dev test — imza olmadan decoded notification ya da internal event kabul eder |
 | `GET  /sse/stream`                | Canlı bildirim akışı (SSE) |
+| `GET  /api/config`                | App Store Server API'nin konfigüre olup olmadığını döner |
+| `POST /api/subscribers/:id/sync`  | Kullanıcının tüm geçmiş transaction'larını Apple'dan çek + ingest et |
+| `GET  /api/subscribers/:id/apple-status` | Apple'ın canlı subscription state'ini döner |
 | `GET  /api/metrics`               | Güncel KPI'lar |
 | `GET  /api/daily?days=30`         | Günlük gelir / yeni abone / churn |
 | `GET  /api/mrr-history?days=30`   | Günlük MRR snapshot'ları |
@@ -165,7 +222,7 @@ Bu durumda sadece JWS decode edilir, imza doğrulanmaz. Prod'da **asla** açık 
 
 ## Sınırlamalar / notlar
 
-- **Apple sadece subscription event'i gönderir.** In-app consumable satışlarını veya `.ONE_TIME_CHARGE` harici non-renewing purchase'ları dashboard'a göstermek için App Store Server API `/inApps/v1/transactions/` entegrasyonu gerekir.
+- **Geçmiş veriye erişim** App Store Server API entegrasyonu ile mümkündür (yukarıdaki bölüm). Konfigüre edilmediği sürece webhook'lar sadece "şu anda olan" event'leri görür.
 - **MRR hesabı için period_type tahmini:** Apple `DID_RENEW` notification'ında ürünün periyodunu direkt söylemez. `transaction.type` ve `expiresDate - purchaseDate` farkından tahmin ederiz (weekly/monthly/quarterly/annual). Daha kesin sonuç için `APP_STORE_CONNECT_API` üzerinden product config çekebilirsiniz (isteğe bağlı genişletme).
 - **Kısmi refund desteklenmez** — Apple notification'ında refund her zaman full transaction iadesidir.
 - **Family sharing:** `inAppOwnershipType === 'FAMILY_SHARED'` durumu event'te `is_family_share=1` olarak işaretlenir.

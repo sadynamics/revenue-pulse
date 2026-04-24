@@ -1,8 +1,21 @@
 import { Router } from 'express';
 import { db } from '../db.js';
 import * as analytics from '../services/analytics.js';
+import {
+  backfillUser,
+  fetchAppleSubscriptionState,
+} from '../services/backfill.js';
+import { isConfigured as appstoreApiConfigured } from '../services/appstore-api.js';
 
 export const api = Router();
+
+api.get('/config', (req, res) => {
+  res.json({
+    appstore_api_configured: appstoreApiConfigured(),
+    environment: process.env.APPSTORE_ENVIRONMENT || 'Production',
+    bundle_id: process.env.APPSTORE_BUNDLE_ID || null,
+  });
+});
 
 api.get('/metrics', (req, res) => {
   res.json(analytics.kpis());
@@ -62,6 +75,72 @@ api.get('/subscribers/:id', (req, res) => {
   `).all(req.params.id);
 
   res.json({ subscriber: sub, events });
+});
+
+/** Resolve a transactionId we can give to the App Store Server API for this user. */
+function appleAnchorTxFor(appUserId) {
+  const sub = db.prepare(
+    'SELECT app_user_id, original_app_user_id FROM subscribers WHERE app_user_id = ?'
+  ).get(appUserId);
+  if (!sub) return null;
+
+  // Prefer an explicit Apple originalTransactionId from any event row.
+  const row = db.prepare(`
+    SELECT original_transaction_id, transaction_id
+    FROM events
+    WHERE app_user_id = ? AND original_transaction_id IS NOT NULL
+    ORDER BY event_timestamp_ms ASC
+    LIMIT 1
+  `).get(appUserId);
+  if (row?.original_transaction_id) return row.original_transaction_id;
+  if (row?.transaction_id) return row.transaction_id;
+
+  // Falls back to the user id itself if it looks numeric (Apple OTIDs are numeric strings).
+  if (/^\d+$/.test(sub.original_app_user_id || '')) return sub.original_app_user_id;
+  if (/^\d+$/.test(appUserId)) return appUserId;
+  return null;
+}
+
+/**
+ * Pull the full transaction history for a single subscriber from Apple and
+ * merge it into our DB. Idempotent — replays existing transactions are skipped.
+ */
+api.post('/subscribers/:id/sync', async (req, res) => {
+  if (!appstoreApiConfigured()) {
+    return res.status(400).json({
+      error: 'appstore_api_not_configured',
+      message: 'Set APPSTORE_ISSUER_ID, APPSTORE_KEY_ID, APPSTORE_PRIVATE_KEY[_PATH] and APPSTORE_BUNDLE_ID.',
+    });
+  }
+  const anchor = req.body?.transactionId || appleAnchorTxFor(req.params.id);
+  if (!anchor) {
+    return res.status(400).json({
+      error: 'no_anchor_transaction',
+      message: 'Could not find an Apple transaction ID for this user. Pass { transactionId } in the body.',
+    });
+  }
+  try {
+    const result = await backfillUser(anchor);
+    res.json({ ok: true, anchor, ...result });
+  } catch (err) {
+    console.error('[api] sync failed:', err.message);
+    res.status(err.status || 500).json({ error: 'sync_failed', message: err.message });
+  }
+});
+
+/** Live Apple subscription status (autoRenewStatus, expiresDate, product, etc). */
+api.get('/subscribers/:id/apple-status', async (req, res) => {
+  if (!appstoreApiConfigured()) {
+    return res.status(400).json({ error: 'appstore_api_not_configured' });
+  }
+  const anchor = appleAnchorTxFor(req.params.id);
+  if (!anchor) return res.status(400).json({ error: 'no_anchor_transaction' });
+  try {
+    const data = await fetchAppleSubscriptionState(anchor);
+    res.json({ anchor, ...data });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: 'apple_status_failed', message: err.message });
+  }
 });
 
 api.get('/events', (req, res) => {

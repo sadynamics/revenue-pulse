@@ -29,6 +29,7 @@ const fmtCountdown = (ms) => {
   return `${d}d ${h}h`;
 };
 const truncate = (s, n = 12) => (!s ? '' : (s.length > n ? s.slice(0, n) + '…' : s));
+const boolBadge = (v) => (v == null ? '—' : (v ? '<span class="badge badge-ok">yes</span>' : '<span class="badge badge-warn">no</span>'));
 
 // Event type styles
 const EVT_META = {
@@ -78,6 +79,8 @@ async function renderOverview() {
   setTitle('Overview', 'Realtime KPIs across your subscriptions');
   const [s, notifs] = await Promise.all([api('/summary'), api('/notifications?limit=15')]);
   const k = s.kpis;
+  const prodNet30 = s.daily.reduce((sum, d) => sum + (d.production_net_revenue || 0), 0);
+  const sandboxNet30 = s.daily.reduce((sum, d) => sum + (d.sandbox_net_revenue || 0), 0);
 
   $('#page').innerHTML = `
     <!-- KPI grid -->
@@ -95,6 +98,10 @@ async function renderOverview() {
       ${kpiCard('Refunds 30d',      fmtMoney(k.refunds_30d))}
       ${kpiCard('Net rev. 30d',     fmtMoney(k.net_revenue_30d))}
       ${kpiCard('Avg LTV',          fmtMoney(k.avg_ltv_usd))}
+    </section>
+    <section class="grid grid-cols-2 md:grid-cols-4 gap-4">
+      ${kpiCard('Prod net 30d',     fmtMoney(prodNet30))}
+      ${kpiCard('Sandbox net 30d',  fmtMoney(sandboxNet30))}
     </section>
 
     <!-- Charts -->
@@ -484,6 +491,13 @@ async function renderDebug() {
         </button>
       </div>
       <div id="backfill-status" class="hidden mt-3 text-sm"></div>
+      <div class="mt-4 pt-4 border-t border-ink-700/60">
+        <div class="flex items-center gap-2 flex-wrap">
+          <button id="reconcile-run-btn" class="btn-ghost text-sm" ${cfg.appstore_api_configured ? '' : 'disabled'}>🛠 Run reconcile now</button>
+          <button id="reconcile-refresh-btn" class="btn-ghost text-sm">↻ Refresh reconcile status</button>
+        </div>
+        <div id="reconcile-status" class="text-xs text-ink-400 mt-2"></div>
+      </div>
     </section>
 
     <section class="grid grid-cols-1 xl:grid-cols-2 gap-6">
@@ -496,7 +510,7 @@ async function renderDebug() {
         </div>
       </div>
       <div class="card">
-        <h3 class="font-semibold mb-3">Send test notification</h3>
+        <h3 class="font-semibold mb-3">Send test notification (local simulator)</h3>
         <div class="flex flex-wrap gap-2 mb-3">
           ${[
             ['SUBSCRIBED','INITIAL_BUY'],
@@ -513,6 +527,23 @@ async function renderDebug() {
         </div>
         <div class="text-xs text-ink-400">Will POST a decoded Apple notification to <code>/webhook/test</code> (bypasses JWS verification).</div>
       </div>
+    </section>
+
+    <section class="card mb-6">
+      <h3 class="font-semibold mb-3">Send test notification (Apple API)</h3>
+      <div class="text-xs text-ink-400 mb-3">
+        Calls App Store Server API <code>/inApps/v1/notifications/test</code>. Apple then sends a real signed TEST notification to your configured webhook URL.
+      </div>
+      <div class="flex items-center gap-2 flex-wrap mb-3">
+        <label class="text-xs text-ink-400">Environment</label>
+        <select id="apple-test-env" class="text-sm">
+          <option value="Sandbox">Sandbox</option>
+          <option value="Production">Production</option>
+        </select>
+        <button id="apple-test-send-btn" class="btn-ghost text-sm" ${cfg.appstore_api_configured ? '' : 'disabled'}>🚀 Send Apple test</button>
+        <button id="apple-test-poll-btn" class="btn-ghost text-sm" disabled>🔎 Check status</button>
+      </div>
+      <div id="apple-test-status" class="text-xs text-ink-400"></div>
     </section>
 
     <section class="card">
@@ -549,6 +580,102 @@ async function renderDebug() {
       status.className = 'mt-3 text-sm text-emerald-400';
       status.textContent = `✓ Done. Users ${items.length} · fetched ${fetched} · inserted ${inserted} · skipped ${skipped} · errors ${errors}.`;
       backfillBtn.disabled = false;
+    });
+  }
+
+  const reconcileStatusEl = $('#reconcile-status');
+  const reconcileRefreshBtn = $('#reconcile-refresh-btn');
+  const reconcileRunBtn = $('#reconcile-run-btn');
+
+  const loadReconcileStatus = async () => {
+    try {
+      const st = await api('/reconcile/status');
+      if (st.running) {
+        reconcileStatusEl.textContent = 'Reconcile is currently running…';
+        return;
+      }
+      if (st.last_result) {
+        const r = st.last_result;
+        reconcileStatusEl.textContent =
+          `Last run: users=${r.users}, checked=${r.checked}, drifted=${r.drifted}, repaired=${r.repaired_events}, refunds=${r.refund_events}, errors=${r.errors} (${new Date(r.finished_at).toLocaleString()})`;
+      } else {
+        reconcileStatusEl.textContent = 'No reconcile run yet.';
+      }
+    } catch (err) {
+      reconcileStatusEl.textContent = `Failed to load reconcile status: ${err.message}`;
+    }
+  };
+  if (reconcileRefreshBtn) reconcileRefreshBtn.addEventListener('click', loadReconcileStatus);
+  if (reconcileRunBtn) {
+    reconcileRunBtn.addEventListener('click', async () => {
+      reconcileRunBtn.disabled = true;
+      reconcileStatusEl.textContent = 'Running reconcile…';
+      try {
+        const out = await fetch('/api/reconcile/run', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ limit: 200, repair: true }),
+        }).then(res => res.json());
+        if (out.error) throw new Error(out.message || out.error);
+        reconcileStatusEl.textContent =
+          `Done: checked=${out.checked}, drifted=${out.drifted}, repaired=${out.repaired_events}, refunds=${out.refund_events}, errors=${out.errors}.`;
+      } catch (err) {
+        reconcileStatusEl.textContent = `Reconcile failed: ${err.message}`;
+      } finally {
+        reconcileRunBtn.disabled = false;
+      }
+    });
+  }
+  loadReconcileStatus();
+
+  const appleSendBtn = $('#apple-test-send-btn');
+  const applePollBtn = $('#apple-test-poll-btn');
+  const appleStatusEl = $('#apple-test-status');
+  const appleEnvSel = $('#apple-test-env');
+  if (appleEnvSel && cfg.environment) {
+    appleEnvSel.value = /sandbox/i.test(cfg.environment) ? 'Sandbox' : 'Production';
+  }
+  let appleTestToken = null;
+
+  if (appleSendBtn) {
+    appleSendBtn.addEventListener('click', async () => {
+      const env = $('#apple-test-env')?.value || 'Sandbox';
+      appleSendBtn.disabled = true;
+      appleStatusEl.textContent = `Sending Apple test notification (${env})…`;
+      try {
+        const r = await fetch('/api/appstore/test-notification', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ environment: env }),
+        }).then(res => res.json());
+        if (r.error) throw new Error(r.message || r.error);
+        appleTestToken = r.testNotificationToken || null;
+        appleStatusEl.innerHTML = `✅ Sent. token: <span class="font-mono">${appleTestToken || 'n/a'}</span>. Click <b>Check status</b> after a few seconds.`;
+        applePollBtn.disabled = !appleTestToken;
+      } catch (err) {
+        appleStatusEl.textContent = `❌ Failed: ${err.message}`;
+      } finally {
+        appleSendBtn.disabled = false;
+      }
+    });
+  }
+
+  if (applePollBtn) {
+    applePollBtn.addEventListener('click', async () => {
+      if (!appleTestToken) return;
+      const env = $('#apple-test-env')?.value || 'Sandbox';
+      applePollBtn.disabled = true;
+      appleStatusEl.textContent = `Checking status (${env})…`;
+      try {
+        const r = await fetch(`/api/appstore/test-notification/${encodeURIComponent(appleTestToken)}?environment=${encodeURIComponent(env)}`)
+          .then(res => res.json());
+        if (r.error) throw new Error(r.message || r.error);
+        appleStatusEl.innerHTML = `<span class="text-emerald-300">Status response received.</span> <span class="font-mono">${JSON.stringify(r).slice(0, 280)}${JSON.stringify(r).length > 280 ? '…' : ''}</span>`;
+      } catch (err) {
+        appleStatusEl.textContent = `❌ Status failed: ${err.message}`;
+      } finally {
+        applePollBtn.disabled = false;
+      }
     });
   }
 
@@ -615,6 +742,42 @@ window.showRawEvent = async (id) => {
   pre.classList.remove('hidden');
 };
 
+function renderAppleStatusCard(statusData) {
+  if (!statusData) return '';
+  if (statusData.error) {
+    return `
+      <div class="card mb-6 border border-rose-500/30">
+        <div class="text-sm text-rose-300">Apple status check failed: ${statusData.message || statusData.error}</div>
+      </div>
+    `;
+  }
+  const drift = statusData.drift || {};
+  const issues = drift.issues || [];
+  return `
+    <div class="card mb-6 ${drift.has_drift ? 'border border-amber-500/30' : 'border border-emerald-500/20'}">
+      <div class="flex items-center justify-between mb-3">
+        <h4 class="font-semibold">Apple Live Status</h4>
+        <span class="text-xs ${drift.has_drift ? 'text-amber-300' : 'text-emerald-300'}">
+          ${drift.has_drift ? 'drift detected' : 'in sync'}
+        </span>
+      </div>
+      <div class="grid grid-cols-2 gap-3 text-sm mb-3">
+        <div><span class="text-ink-400">Environment:</span> <span class="font-medium">${statusData.apple?.environment || statusData.environment || '—'}</span></div>
+        <div><span class="text-ink-400">Anchor:</span> <span class="font-mono text-xs">${truncate(statusData.anchor || '', 18)}</span></div>
+        <div><span class="text-ink-400">Local will renew:</span> ${boolBadge(statusData.local?.will_renew)}</div>
+        <div><span class="text-ink-400">Apple will renew:</span> ${boolBadge(statusData.apple?.will_renew)}</div>
+        <div><span class="text-ink-400">Local expires:</span> <span class="font-medium">${fmtDate(statusData.local?.expiration_ms)}</span></div>
+        <div><span class="text-ink-400">Apple expires:</span> <span class="font-medium">${fmtDate(statusData.apple?.expiration_ms)}</span></div>
+      </div>
+      ${issues.length ? `
+        <div class="space-y-2">
+          ${issues.map(i => `<div class="text-xs rounded-md px-2 py-1 ${i.severity === 'danger' ? 'bg-rose-500/15 text-rose-200' : 'bg-amber-500/15 text-amber-100'}">${i.code}: ${i.message}</div>`).join('')}
+        </div>
+      ` : `<div class="text-xs text-emerald-300">No drift found between local DB and Apple live state.</div>`}
+    </div>
+  `;
+}
+
 // ============================================================
 // SUBSCRIBER DETAIL
 // ============================================================
@@ -626,6 +789,9 @@ async function openSubscriber(id) {
   ]);
   const s = data.subscriber;
   const canSync = !!cfg.appstore_api_configured;
+  const appleStatus = canSync
+    ? await api(`/subscribers/${encodeURIComponent(id)}/apple-status`).catch(err => ({ error: 'apple_status_failed', message: err.message }))
+    : null;
   $('#sub-modal').classList.remove('hidden');
   $('#sub-modal-body').innerHTML = `
     <div class="flex items-start justify-between mb-6 gap-4">
@@ -644,10 +810,13 @@ async function openSubscriber(id) {
           ? `<button id="sub-sync-btn" class="btn-ghost text-sm" data-id="${encodeURIComponent(s.app_user_id)}" title="Pull this user's full purchase history from the App Store Server API">🔄 Sync from App Store</button>`
           : `<span class="text-xs text-ink-400" title="Set APPSTORE_ISSUER_ID, APPSTORE_KEY_ID, APPSTORE_PRIVATE_KEY[_PATH], APPSTORE_BUNDLE_ID to enable">App Store API not configured</span>`
         }
+        ${canSync ? `<button id="sub-status-refresh-btn" class="btn-ghost text-sm" data-id="${encodeURIComponent(s.app_user_id)}" title="Refresh live Apple status">🛰 Refresh Apple status</button>` : ''}
         <button class="btn-ghost text-sm" onclick="document.getElementById('sub-modal').classList.add('hidden')">✕</button>
       </div>
     </div>
     <div id="sub-sync-status" class="hidden mb-4 text-sm"></div>
+
+    ${canSync ? renderAppleStatusCard(appleStatus) : ''}
 
     <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
       ${kpiCard('LTV',          fmtMoney(s.ltv_usd))}
@@ -725,6 +894,20 @@ document.addEventListener('click', async (e) => {
       syncBtn.textContent = '🔄 Sync from App Store';
     }
   }
+
+  const statusBtn = e.target.closest('#sub-status-refresh-btn');
+  if (statusBtn) {
+    const id = decodeURIComponent(statusBtn.dataset.id);
+    statusBtn.disabled = true;
+    const old = statusBtn.textContent;
+    statusBtn.textContent = '⏳ Refreshing…';
+    try {
+      await openSubscriber(id);
+    } finally {
+      statusBtn.disabled = false;
+      statusBtn.textContent = old || '🛰 Refresh Apple status';
+    }
+  }
 });
 
 document.addEventListener('keydown', (e) => {
@@ -783,11 +966,22 @@ function drawRevenueDaily(daily) {
       datasets: [
         { label: 'Revenue', data: daily.map(d => d.revenue), backgroundColor: '#22c55e' },
         { label: 'Refunds', data: daily.map(d => -d.refunds), backgroundColor: '#ef4444' },
+        {
+          label: 'Net',
+          type: 'line',
+          data: daily.map(d => d.net_revenue || (d.revenue - d.refunds)),
+          borderColor: '#7c5cff',
+          backgroundColor: 'rgba(124,92,255,.15)',
+          borderWidth: 2,
+          tension: 0.25,
+          pointRadius: 0,
+          yAxisID: 'y',
+        },
       ]
     },
     options: {
       ...chartBaseOpts(),
-      plugins: { legend: { position: 'top' }, tooltip: { callbacks: { label: (c) => c.dataset.label + ': ' + fmtMoney(Math.abs(c.raw)) } } },
+      plugins: { legend: { position: 'top' }, tooltip: { callbacks: { label: (c) => c.dataset.label + ': ' + fmtMoney(c.dataset.label === 'Refunds' ? Math.abs(c.raw) : c.raw) } } },
       scales: { x: { stacked: true, grid: { display: false }, ticks: { color: '#6b7194' } },
                 y: { stacked: true, grid: { color: '#2a2f4455' }, ticks: { color: '#6b7194', callback: (v) => '$' + v } } }
     }

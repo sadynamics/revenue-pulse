@@ -9,7 +9,8 @@
     "dev": "node --watch src/index.js",
     "seed": "node src/scripts/seed.js",
     "simulate": "node src/scripts/simulate.js",
-    "backfill": "node src/scripts/backfill.js"
+    "backfill": "node src/scripts/backfill.js",
+    "reconcile": "node src/scripts/reconcile.js"
   },
   "engines": {
     "node": "22.x"

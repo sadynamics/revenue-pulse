@@ -28,8 +28,14 @@ const HOSTS = {
   SANDBOX:    'https://api.storekit-sandbox.itunes.apple.com',
 };
 
-function host() {
-  const env = (process.env.APPSTORE_ENVIRONMENT || 'Production').toUpperCase();
+function normalizeEnvironment(env) {
+  return (env || process.env.APPSTORE_ENVIRONMENT || 'Production').toUpperCase() === 'SANDBOX'
+    ? 'SANDBOX'
+    : 'PRODUCTION';
+}
+
+function host(envOverride) {
+  const env = normalizeEnvironment(envOverride);
   return env === 'SANDBOX' ? HOSTS.SANDBOX : HOSTS.PRODUCTION;
 }
 
@@ -128,27 +134,41 @@ function ecdsaDerToRaw(der) {
 // HTTP helpers
 // ---------------------------------------------------------------
 
-async function appleGet(path, query = {}) {
-  const url = new URL(`${host()}${path}`);
+async function appleRequest(method, path, { query = {}, body, environment } = {}) {
+  const url = new URL(`${host(environment)}${path}`);
   for (const [k, v] of Object.entries(query)) {
     if (v != null) url.searchParams.set(k, String(v));
   }
+  const headers = {
+    authorization: `Bearer ${generateToken()}`,
+    accept: 'application/json',
+  };
+  if (body != null) headers['content-type'] = 'application/json';
   const res = await fetch(url, {
+    method,
     headers: {
-      authorization: `Bearer ${generateToken()}`,
-      accept: 'application/json',
+      ...headers,
     },
+    body: body != null ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
-  let body;
-  try { body = JSON.parse(text); } catch (_) { body = text; }
+  let parsed;
+  try { parsed = JSON.parse(text); } catch (_) { parsed = text; }
   if (!res.ok) {
-    const err = new Error(`appstore_api_${res.status}: ${typeof body === 'string' ? body : (body.errorMessage || JSON.stringify(body))}`);
+    const err = new Error(`appstore_api_${res.status}: ${typeof parsed === 'string' ? parsed : (parsed.errorMessage || JSON.stringify(parsed))}`);
     err.status = res.status;
-    err.body = body;
+    err.body = parsed;
     throw err;
   }
-  return body;
+  return parsed;
+}
+
+async function appleGet(path, query = {}, opts = {}) {
+  return appleRequest('GET', path, { query, ...opts });
+}
+
+async function applePost(path, body = {}, opts = {}) {
+  return appleRequest('POST', path, { body, ...opts });
 }
 
 // ---------------------------------------------------------------
@@ -200,7 +220,7 @@ export async function getTransactionHistory(transactionId, opts = {}) {
       endDate: opts.endDate,
       revoked: opts.revoked,
       inAppOwnershipType: opts.inAppOwnershipType,
-    });
+    }, { environment: opts.environment });
 
     if (Array.isArray(data.signedTransactions)) {
       all.push(...data.signedTransactions);
@@ -223,7 +243,7 @@ export async function getTransactionHistory(transactionId, opts = {}) {
 export async function getSubscriptionStatuses(transactionId, opts = {}) {
   return appleGet(`/inApps/v1/subscriptions/${encodeURIComponent(transactionId)}`, {
     status: opts.status, // optional filter
-  });
+  }, { environment: opts.environment });
 }
 
 /**
@@ -240,7 +260,7 @@ export async function getRefundHistory(transactionId, opts = {}) {
   while (true) {
     const data = await appleGet(`/inApps/v2/refund/lookup/${encodeURIComponent(transactionId)}`, {
       revision: revision || undefined,
-    });
+    }, { environment: opts.environment });
     if (Array.isArray(data.signedTransactions)) {
       all.push(...data.signedTransactions);
     }
@@ -250,4 +270,31 @@ export async function getRefundHistory(transactionId, opts = {}) {
     if (!revision) break;
   }
   return all;
+}
+
+/**
+ * Ask Apple to send a signed TEST notification to your configured App Store
+ * Server Notification URL.
+ *
+ * Environment is selected by API host:
+ *  - Sandbox host => Sandbox test notification
+ *  - Production host => Production test notification
+ *
+ * Returns: { testNotificationToken: "..." }
+ */
+export async function requestTestNotification({ environment } = {}) {
+  return applePost('/inApps/v1/notifications/test', {}, { environment });
+}
+
+/**
+ * Poll test notification result by token.
+ *
+ * Returns Apple's delivery result to your webhook endpoint.
+ */
+export async function getTestNotificationStatus(testNotificationToken, { environment } = {}) {
+  return appleGet(
+    `/inApps/v1/notifications/test/${encodeURIComponent(testNotificationToken)}`,
+    {},
+    { environment }
+  );
 }

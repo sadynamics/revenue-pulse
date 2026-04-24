@@ -103,6 +103,34 @@ const eventExistsByTxStmt = db.prepare(
   'SELECT 1 AS x FROM events WHERE transaction_id = ? LIMIT 1'
 );
 
+const subscriberByIdStmt = db.prepare(
+  'SELECT app_user_id, original_app_user_id FROM subscribers WHERE app_user_id = ?'
+);
+const firstAppleEventForUserStmt = db.prepare(`
+  SELECT original_transaction_id, transaction_id
+  FROM events
+  WHERE app_user_id = ? AND original_transaction_id IS NOT NULL
+  ORDER BY event_timestamp_ms ASC
+  LIMIT 1
+`);
+
+/**
+ * Resolve a transaction anchor we can pass to App Store Server API for this user.
+ * Prefers originalTransactionId, then transactionId, then numeric user ids.
+ */
+export function resolveAppleAnchorTx(appUserId) {
+  const sub = subscriberByIdStmt.get(appUserId);
+  if (!sub) return null;
+
+  const row = firstAppleEventForUserStmt.get(appUserId);
+  if (row?.original_transaction_id) return row.original_transaction_id;
+  if (row?.transaction_id) return row.transaction_id;
+
+  if (/^\d+$/.test(sub.original_app_user_id || '')) return sub.original_app_user_id;
+  if (/^\d+$/.test(appUserId || '')) return appUserId;
+  return null;
+}
+
 /**
  * Backfill a single user. `transactionId` may be either an originalTransactionId
  * or any transactionId in the user's family — Apple resolves the chain.
@@ -154,9 +182,9 @@ export async function backfillUser(transactionId, opts = {}) {
  * (without inserting). Useful for UI panels and reconciling local will_renew /
  * expiration state vs. Apple's truth.
  */
-export async function fetchAppleSubscriptionState(transactionId) {
+export async function fetchAppleSubscriptionState(transactionId, opts = {}) {
   if (!isConfigured()) throw new Error('appstore_api_not_configured');
-  const data = await getSubscriptionStatuses(transactionId);
+  const data = await getSubscriptionStatuses(transactionId, opts);
   // Decode the signed transaction + renewal info on each status entry so the
   // dashboard can show product, expiry, autoRenewStatus, etc. without a second
   // round of decoding work in the frontend.

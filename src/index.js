@@ -9,6 +9,7 @@ import { dirname, resolve } from 'node:path';
 import { api } from './routes/api.js';
 import { webhook } from './routes/webhook.js';
 import { sse } from './routes/sse.js';
+import { startReconcileScheduler } from './services/reconcile.js';
 import './db.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -62,4 +63,5 @@ app.listen(PORT, () => {
   console.log(`\n  ⚡ Revenue Pulse ready at http://localhost:${PORT}`);
   console.log(`  ⤷ Webhook:  POST /webhook`);
   console.log(`  ⤷ Dashboard: /\n`);
+  startReconcileScheduler();
 });

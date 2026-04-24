@@ -27,6 +27,9 @@ Webhook'lar JWS olarak gelir, imzası doğrulanır, içindeki `signedTransaction
 - **📡 Idempotent ingest** – Aynı `notificationUUID` duplicate olarak işaretlenir
 - **🔁 Apple-spesifik alanlar** – `originalTransactionId`, `webOrderLineItemId`, `appAccountToken`
 - **📜 Transaction history backfill** – Yeni bir kullanıcı görüldüğünde, App Store Server API üzerinden tüm geçmiş satın alımları (yenilemeler, iade, lifetime, consumable) **otomatik** çekilir. Manuel "Sync from App Store" butonu ve `npm run backfill` da mevcut.
+- **🛰 Drift detection** – Subscriber modalında local state vs Apple canlı state karşılaştırması (`autoRenewStatus`, `expiresDate`) ve drift uyarıları
+- **🛠 Daily reconcile job** – Aktif kullanıcıları periyodik tarayıp kaçan `EXPIRATION` / `CANCELLATION` / `REFUND` event'lerini otomatik düzeltir
+- **🧪 Apple test notification trigger** – Dashboard'dan doğrudan App Store Server API `notifications/test` çağrısı (Sandbox/Production seçimi)
 
 ## Mimari
 
@@ -136,6 +139,14 @@ APPSTORE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nMIG...\n-----END PRIVATE KEY-
 
 > Railway'de PEM string'i kopyalarken newline'ları `\n` literal olarak yaz; uygulama içinde tekrar satır sonlarına çevriliyor.
 
+Reconcile scheduler ayarları:
+
+```bash
+APPSTORE_RECONCILE_ENABLED=true
+APPSTORE_RECONCILE_INTERVAL_HOURS=24
+APPSTORE_RECONCILE_BATCH_LIMIT=200
+```
+
 Konfigüre edilmediği sürece:
 
 - Webhook'lar normal çalışır, **dashboard hiçbir geriye dönük veri görmez** — sadece deploy sonrası gelen event'ler işlenir.
@@ -201,9 +212,13 @@ History endpoint'i tüm IAP tiplerini döner:
 | `GET  /sse/stream`                | Canlı bildirim akışı (SSE) |
 | `GET  /api/config`                | App Store Server API'nin konfigüre olup olmadığını döner |
 | `POST /api/subscribers/:id/sync`  | Kullanıcının tüm geçmiş transaction'larını Apple'dan çek + ingest et |
-| `GET  /api/subscribers/:id/apple-status` | Apple'ın canlı subscription state'ini döner |
+| `GET  /api/subscribers/:id/apple-status` | Apple canlı state + local state drift analizi (`has_drift`, issue listesi) |
+| `POST /api/appstore/test-notification` | Apple'a TEST notification gönderimini tetikler (Sandbox/Production) |
+| `GET  /api/appstore/test-notification/:token` | Gönderilen test notification sonucunu poll eder |
+| `POST /api/reconcile/run`         | Reconcile job'ı manuel tetikler |
+| `GET  /api/reconcile/status`      | Son reconcile run sonucunu döner |
 | `GET  /api/metrics`               | Güncel KPI'lar |
-| `GET  /api/daily?days=30`         | Günlük gelir / yeni abone / churn |
+| `GET  /api/daily?days=30`         | Günlük gelir/refund/net + sandbox/production kırılımı |
 | `GET  /api/mrr-history?days=30`   | Günlük MRR snapshot'ları |
 | `GET  /api/subscribers?q=&status=`| Subscriber listesi |
 | `GET  /api/subscribers/:id`       | Subscriber + event timeline |
@@ -223,6 +238,7 @@ History endpoint'i tüm IAP tiplerini döner:
 ## Sınırlamalar / notlar
 
 - **Geçmiş veriye erişim** App Store Server API entegrasyonu ile mümkündür (yukarıdaki bölüm). Konfigüre edilmediği sürece webhook'lar sadece "şu anda olan" event'leri görür.
+- **Reconcile job** aktif kullanıcılar için çalışır; çok büyük datasetlerde batch boyutunu düşürerek API rate-limit riskini azaltın.
 - **MRR hesabı için period_type tahmini:** Apple `DID_RENEW` notification'ında ürünün periyodunu direkt söylemez. `transaction.type` ve `expiresDate - purchaseDate` farkından tahmin ederiz (weekly/monthly/quarterly/annual). Daha kesin sonuç için `APP_STORE_CONNECT_API` üzerinden product config çekebilirsiniz (isteğe bağlı genişletme).
 - **Kısmi refund desteklenmez** — Apple notification'ında refund her zaman full transaction iadesidir.
 - **Family sharing:** `inAppOwnershipType === 'FAMILY_SHARED'` durumu event'te `is_family_share=1` olarak işaretlenir.

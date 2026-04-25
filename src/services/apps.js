@@ -167,6 +167,52 @@ export function reloadApps() {
   _byId.clear();
   _byBundleId.clear();
 
+  // ---- Reconcile renames from previous deploys ----
+  // If a configured app shares its bundle_id with an existing apps row that
+  // has a different id (e.g. legacy single-app deploy used id="<bundle>" and
+  // now APPS_CONFIG uses id="torq"), migrate the historical events/subs/
+  // notifications to the new id and delete the old apps row. This keeps
+  // existing analytics tied to the renamed app.
+  const existingRows = db.prepare(`SELECT id, bundle_id FROM apps`).all();
+  const existingIdsByBundle = new Map();
+  for (const row of existingRows) {
+    if (!existingIdsByBundle.has(row.bundle_id)) {
+      existingIdsByBundle.set(row.bundle_id, []);
+    }
+    existingIdsByBundle.get(row.bundle_id).push(row.id);
+  }
+
+  const newIdsByBundle = new Map();
+  for (const a of apps) newIdsByBundle.set(a.bundle_id, a.id);
+
+  const updateEventsAppId = db.prepare(`UPDATE events SET app_id = ? WHERE app_id = ?`);
+  const updateSubsAppId = db.prepare(`UPDATE OR IGNORE subscribers SET app_id = ? WHERE app_id = ?`);
+  const deleteSubsLeftover = db.prepare(`DELETE FROM subscribers WHERE app_id = ?`);
+  const updateNotifsAppId = db.prepare(`UPDATE notifications SET app_id = ? WHERE app_id = ?`);
+  const deleteAppById = db.prepare(`DELETE FROM apps WHERE id = ?`);
+
+  for (const [bundleId, newId] of newIdsByBundle.entries()) {
+    const oldIds = existingIdsByBundle.get(bundleId) || [];
+    for (const oldId of oldIds) {
+      if (oldId === newId) continue;
+      try {
+        const ev = updateEventsAppId.run(newId, oldId);
+        const su = updateSubsAppId.run(newId, oldId);
+        // UPDATE OR IGNORE leaves any conflicting rows (very rare) behind;
+        // clean them up so the old id has no orphans.
+        const suLeft = deleteSubsLeftover.run(oldId);
+        const nf = updateNotifsAppId.run(newId, oldId);
+        deleteAppById.run(oldId);
+        console.log(
+          `[apps][migrate] renamed app ${oldId} → ${newId} (bundle_id=${bundleId}): ` +
+          `${ev.changes} events, ${su.changes + suLeft.changes} subscribers, ${nf.changes} notifications`
+        );
+      } catch (err) {
+        console.warn(`[apps][migrate] failed to rename ${oldId} → ${newId}: ${err.message}`);
+      }
+    }
+  }
+
   const now = Date.now();
   for (const app of apps) {
     _byId.set(app.id, app);

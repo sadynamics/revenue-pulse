@@ -41,7 +41,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS apps (
     id            TEXT PRIMARY KEY,
     name          TEXT NOT NULL,
-    bundle_id     TEXT NOT NULL UNIQUE,
+    bundle_id     TEXT NOT NULL,
     environment   TEXT NOT NULL DEFAULT 'Production',
     created_at_ms INTEGER NOT NULL DEFAULT 0
   );
@@ -155,6 +155,31 @@ function tableColumns(table) {
   if (!tableColumns('notifications').includes('app_id')) {
     db.exec(`ALTER TABLE notifications ADD COLUMN app_id TEXT;`);
     console.log('[db][migrate] added notifications.app_id');
+  }
+
+  // 2b. apps.bundle_id originally had a UNIQUE constraint, but that prevented
+  //     graceful renames (e.g. switching from legacy single-app id="<bundle>"
+  //     to a stable id like "torq" via APPS_CONFIG). The in-memory registry
+  //     enforces bundle_id uniqueness anyway. Drop the table-level constraint
+  //     by rebuilding the table when we detect it.
+  const appsSchemaRow = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='apps'`)
+    .get();
+  if (appsSchemaRow && /bundle_id\s+\w[^,]*\bUNIQUE\b/i.test(appsSchemaRow.sql)) {
+    db.exec(`
+      ALTER TABLE apps RENAME TO apps_old_unique_bundle;
+      CREATE TABLE apps (
+        id            TEXT PRIMARY KEY,
+        name          TEXT NOT NULL,
+        bundle_id     TEXT NOT NULL,
+        environment   TEXT NOT NULL DEFAULT 'Production',
+        created_at_ms INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO apps (id, name, bundle_id, environment, created_at_ms)
+      SELECT id, name, bundle_id, environment, created_at_ms FROM apps_old_unique_bundle;
+      DROP TABLE apps_old_unique_bundle;
+    `);
+    console.log('[db][migrate] dropped UNIQUE constraint on apps.bundle_id');
   }
 
   // 3. subscribers needs app_id + composite PK. SQLite can't add a column to

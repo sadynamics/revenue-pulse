@@ -52,11 +52,65 @@ const evBadge = (type) => {
   return `<span class="badge ${m.cls}">${m.label}</span>`;
 };
 
+// ============================================================
+// APP SELECTION (multi-app support)
+// ============================================================
+
+const STATE = {
+  appId: localStorage.getItem('rp.app_id') || '', // '' means "all apps"
+  apps: [],
+};
+
+/** Append the currently selected app_id (if any) to a path. */
+function withAppId(path) {
+  if (!STATE.appId) return path;
+  const sep = path.includes('?') ? '&' : '?';
+  return `${path}${sep}app_id=${encodeURIComponent(STATE.appId)}`;
+}
+
 // API helpers
 async function api(path) {
-  const r = await fetch('/api' + path);
+  const r = await fetch('/api' + withAppId(path));
   if (!r.ok) throw new Error(`API ${path} → ${r.status}`);
   return r.json();
+}
+
+/** POST helper that includes app_id both as query param and (for JSON bodies) in the body. */
+async function apiPost(path, body = {}) {
+  const finalBody = (body && typeof body === 'object' && !Array.isArray(body))
+    ? { ...(STATE.appId ? { app_id: STATE.appId } : {}), ...body }
+    : body;
+  const r = await fetch('/api' + withAppId(path), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(finalBody),
+  });
+  return r.json();
+}
+
+async function loadApps() {
+  try {
+    const data = await fetch('/api/apps').then(r => r.json());
+    STATE.apps = data.apps || [];
+    const sel = $('#app-select');
+    if (!sel) return;
+    sel.innerHTML = `<option value="">All apps</option>` +
+      STATE.apps
+        .map(a => `<option value="${a.id}">${a.name} · ${a.bundle_id} (${a.environment})</option>`)
+        .join('');
+
+    // Validate persisted selection still exists; otherwise reset.
+    if (STATE.appId && !STATE.apps.some(a => a.id === STATE.appId)) {
+      STATE.appId = '';
+      localStorage.removeItem('rp.app_id');
+    }
+    sel.value = STATE.appId;
+
+    // Hide selector entirely when ≤1 app is configured (less clutter).
+    sel.parentElement.style.display = STATE.apps.length > 1 ? '' : 'none';
+  } catch (err) {
+    console.warn('Failed to load apps:', err.message);
+  }
 }
 
 // Chart palette
@@ -77,7 +131,15 @@ function destroyCharts() {
 
 async function renderOverview() {
   setTitle('Overview', 'Realtime KPIs across your subscriptions');
-  const [s, notifs] = await Promise.all([api('/summary'), api('/notifications?limit=15')]);
+
+  const showPerApp = !STATE.appId && STATE.apps.length > 1;
+  const summaryReq   = api('/summary');
+  const notifsReq    = api('/notifications?limit=15');
+  const breakdownReq = showPerApp
+    ? fetch('/api/daily-by-app?days=30').then(r => r.json()).catch(() => null)
+    : Promise.resolve(null);
+  const [s, notifs, breakdown] = await Promise.all([summaryReq, notifsReq, breakdownReq]);
+
   const k = s.kpis;
   const prodNet30 = s.daily.reduce((sum, d) => sum + (d.production_net_revenue || 0), 0);
   const sandboxNet30 = s.daily.reduce((sum, d) => sum + (d.sandbox_net_revenue || 0), 0);
@@ -117,6 +179,24 @@ async function renderOverview() {
         <h3 class="font-semibold mb-3">Daily revenue vs refunds</h3>
         <div class="h-64"><canvas id="revenueChart"></canvas></div>
       </div>
+    </section>
+
+    <!-- Daily revenue breakdown (numeric) -->
+    <section class="card">
+      <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <div>
+          <h3 class="font-semibold">Daily revenue breakdown (last 30 days)</h3>
+          <div class="text-xs text-ink-400 mt-0.5">${dailyBreakdownSubtitle(s.daily, breakdown)}</div>
+        </div>
+        <div class="text-xs text-ink-400">${
+          showPerApp
+            ? 'Showing all apps — switch to a single app via the App selector for a focused view.'
+            : (STATE.appId
+                ? `Filtered to <span class="text-ink-100">${escapeHtml(currentAppLabel())}</span>`
+                : 'Net = revenue − refunds')
+        }</div>
+      </div>
+      ${renderDailyBreakdown(s.daily, breakdown)}
     </section>
 
     <section class="grid grid-cols-1 xl:grid-cols-2 gap-6">
@@ -471,6 +551,10 @@ async function renderDebug() {
 
   const cfg = await api('/config').catch(() => ({}));
 
+  const appsList = (cfg.apps || []).map(a =>
+    `<span class="badge ${a.api_configured ? 'badge-ok' : 'badge-warn'}">${a.id} · ${a.bundle_id} (${a.environment})${a.api_configured ? '' : ' · no API key'}</span>`
+  ).join(' ');
+
   $('#page').innerHTML = `
     <section class="card mb-6">
       <div class="flex items-start justify-between gap-4 flex-wrap">
@@ -478,9 +562,10 @@ async function renderDebug() {
           <h3 class="font-semibold mb-1">App Store Server API</h3>
           <div class="text-xs text-ink-400">
             ${cfg.appstore_api_configured
-              ? `<span class="text-emerald-400">●</span> Configured · ${cfg.environment || 'Production'} · ${cfg.bundle_id || ''}`
-              : `<span class="text-rose-400">●</span> Not configured — set APPSTORE_ISSUER_ID, APPSTORE_KEY_ID, APPSTORE_PRIVATE_KEY[_PATH], APPSTORE_BUNDLE_ID`}
+              ? `<span class="text-emerald-400">●</span> Configured · ${cfg.selected_app_id ? `app=${cfg.selected_app_id}` : `default=${cfg.default_app_id}`} · ${cfg.environment || 'Production'} · ${cfg.bundle_id || ''}`
+              : `<span class="text-rose-400">●</span> Not configured for this app — set APPS_CONFIG (JSON) or legacy APPSTORE_ISSUER_ID, APPSTORE_KEY_ID, APPSTORE_PRIVATE_KEY[_PATH], APPSTORE_BUNDLE_ID`}
           </div>
+          ${appsList ? `<div class="text-xs text-ink-400 mt-2 flex flex-wrap gap-2">${appsList}</div>` : ''}
           <div class="text-xs text-ink-400 mt-2">
             Used to backfill historical purchases (renewals, refunds, lifetime, consumables) for users seen via webhook.
             New users are auto-backfilled in the background. You can also trigger a sync per-user from the Subscribers list, or backfill everything via <code>npm run backfill</code>.
@@ -570,9 +655,7 @@ async function renderDebug() {
         const u = items[i];
         status.textContent = `Backfilling ${i + 1}/${items.length} · ${u.app_user_id} · inserted ${inserted}, skipped ${skipped}, errors ${errors}`;
         try {
-          const r = await fetch(`/api/subscribers/${encodeURIComponent(u.app_user_id)}/sync`, {
-            method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
-          }).then(res => res.json());
+          const r = await apiPost(`/subscribers/${encodeURIComponent(u.app_user_id)}/sync`, {});
           if (r.error) errors++;
           else { fetched += r.fetched || 0; inserted += r.inserted || 0; skipped += r.skipped || 0; errors += r.errors || 0; }
         } catch (e) { errors++; }
@@ -611,11 +694,7 @@ async function renderDebug() {
       reconcileRunBtn.disabled = true;
       reconcileStatusEl.textContent = 'Running reconcile…';
       try {
-        const out = await fetch('/api/reconcile/run', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ limit: 200, repair: true }),
-        }).then(res => res.json());
+        const out = await apiPost('/reconcile/run', { limit: 200, repair: true });
         if (out.error) throw new Error(out.message || out.error);
         reconcileStatusEl.textContent =
           `Done: checked=${out.checked}, drifted=${out.drifted}, repaired=${out.repaired_events}, refunds=${out.refund_events}, errors=${out.errors}.`;
@@ -643,11 +722,7 @@ async function renderDebug() {
       appleSendBtn.disabled = true;
       appleStatusEl.textContent = `Sending Apple test notification (${env})…`;
       try {
-        const r = await fetch('/api/appstore/test-notification', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ environment: env }),
-        }).then(res => res.json());
+        const r = await apiPost('/appstore/test-notification', { environment: env });
         if (r.error) throw new Error(r.message || r.error);
         appleTestToken = r.testNotificationToken || null;
         appleStatusEl.innerHTML = `✅ Sent. token: <span class="font-mono">${appleTestToken || 'n/a'}</span>. Click <b>Check status</b> after a few seconds.`;
@@ -667,8 +742,7 @@ async function renderDebug() {
       applePollBtn.disabled = true;
       appleStatusEl.textContent = `Checking status (${env})…`;
       try {
-        const r = await fetch(`/api/appstore/test-notification/${encodeURIComponent(appleTestToken)}?environment=${encodeURIComponent(env)}`)
-          .then(res => res.json());
+        const r = await api(`/appstore/test-notification/${encodeURIComponent(appleTestToken)}?environment=${encodeURIComponent(env)}`);
         if (r.error) throw new Error(r.message || r.error);
         appleStatusEl.innerHTML = `<span class="text-emerald-300">Status response received.</span> <span class="font-mono">${JSON.stringify(r).slice(0, 280)}${JSON.stringify(r).length > 280 ? '…' : ''}</span>`;
       } catch (err) {
@@ -685,17 +759,22 @@ async function renderDebug() {
     const originalTxId = 'otx_test_' + Math.random().toString(36).slice(2, 10);
     const appAccountToken = crypto.randomUUID();
     const product = { id: 'com.acme.pro.monthly', price: 9990, days: 30, type: 'Auto-Renewable Subscription', group: 'pro' };
-    await fetch('/webhook/test', {
+    // Route to selected app (by bundleId); fall back to a fake bundle id for the
+    // single-app default deployment so the test endpoint can resolve via fallback.
+    const selectedApp = STATE.apps.find(a => a.id === STATE.appId);
+    const targetBundleId = selectedApp?.bundle_id || 'com.acme.app';
+    await fetch('/webhook/test' + (STATE.appId ? `?app_id=${encodeURIComponent(STATE.appId)}` : ''), {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         notificationType: type, subtype,
         notificationUUID: crypto.randomUUID(), version: '2.0', signedDate: now,
-        data: { appAppleId: 1234567890, bundleId: 'com.acme.app', environment: 'Sandbox' },
+        ...(STATE.appId ? { app_id: STATE.appId } : {}),
+        data: { appAppleId: 1234567890, bundleId: targetBundleId, environment: 'Sandbox' },
         transactionInfo: {
           transactionId: 'tx_' + Math.random().toString(36).slice(2,14),
           originalTransactionId: originalTxId,
           webOrderLineItemId: String(Date.now()),
-          bundleId: 'com.acme.app',
+          bundleId: targetBundleId,
           productId: product.id,
           subscriptionGroupIdentifier: product.group,
           purchaseDate: now, originalPurchaseDate: now,
@@ -877,11 +956,7 @@ document.addEventListener('click', async (e) => {
     status.className = 'mb-4 text-sm text-ink-400';
     status.textContent = 'Pulling full transaction history from the App Store Server API…';
     try {
-      const r = await fetch(`/api/subscribers/${encodeURIComponent(id)}/sync`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: '{}',
-      }).then(res => res.json());
+      const r = await apiPost(`/subscribers/${encodeURIComponent(id)}/sync`, {});
       if (r.error) throw new Error(r.message || r.error);
       status.className = 'mb-4 text-sm text-emerald-400';
       status.textContent = `✓ Synced — fetched ${r.fetched}, inserted ${r.inserted}, skipped ${r.skipped}${r.errors ? `, errors ${r.errors}` : ''}.`;
@@ -1052,6 +1127,123 @@ function emptyState(msg) {
   return `<div class="py-12 text-center text-ink-400 text-sm">${msg}</div>`;
 }
 
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[ch]));
+}
+
+function currentAppLabel() {
+  if (!STATE.appId) return 'All apps';
+  const a = STATE.apps.find(x => x.id === STATE.appId);
+  return a ? `${a.name} · ${a.bundle_id}` : STATE.appId;
+}
+
+/** Sub-title showing the 30d net total — works for both single-app and multi-app modes. */
+function dailyBreakdownSubtitle(daily, breakdown) {
+  if (breakdown && breakdown.grand_total) {
+    return `30d net total: <span class="text-ink-100 font-semibold">${fmtMoney(breakdown.grand_total.net)}</span> · ${breakdown.apps.length} apps`;
+  }
+  const net = daily.reduce((s, d) => s + (d.net_revenue ?? (d.revenue - d.refunds)), 0);
+  return `30d net total: <span class="text-ink-100 font-semibold">${fmtMoney(net)}</span>`;
+}
+
+/**
+ * Render the per-day numeric breakdown.
+ * - Single-app (or 1 app configured): a clean two-column "Date — $X" list.
+ * - Multi-app + "All apps" selected: a wide table with one column per app
+ *   plus a Total column. Days without activity are omitted to keep the list short.
+ */
+function renderDailyBreakdown(daily, breakdown) {
+  const formatDate = (iso) => {
+    const d = new Date(iso + 'T00:00:00Z');
+    return d.toLocaleDateString(undefined, {
+      month: 'short', day: 'numeric', weekday: 'short',
+    });
+  };
+
+  // Multi-app comparison view.
+  if (breakdown && breakdown.apps && breakdown.apps.length > 1) {
+    const { apps, rows, totals_by_app, grand_total } = breakdown;
+
+    const visibleRows = rows.filter(r => Math.abs(r.total_net) > 0.005);
+    if (!visibleRows.length) {
+      return emptyState('No revenue activity in the last 30 days');
+    }
+    return `
+      <div class="overflow-x-auto">
+        <table class="table">
+          <thead>
+            <tr>
+              <th class="whitespace-nowrap">Date</th>
+              ${apps.map(a => `<th class="text-right whitespace-nowrap" title="${escapeHtml(a.bundle_id)}">${escapeHtml(a.name)}</th>`).join('')}
+              <th class="text-right whitespace-nowrap">Total net</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${visibleRows.slice().reverse().map(r => `
+              <tr>
+                <td class="whitespace-nowrap">${formatDate(r.date)} <span class="text-ink-400 text-xs">${r.date}</span></td>
+                ${apps.map(a => {
+                  const cell = r.by_app[a.id] || { net: 0 };
+                  const cls = cell.net > 0 ? 'text-emerald-300'
+                            : cell.net < 0 ? 'text-red-300' : 'text-ink-400';
+                  return `<td class="text-right font-mono ${cls}">${fmtMoney(cell.net)}</td>`;
+                }).join('')}
+                <td class="text-right font-mono font-semibold">${fmtMoney(r.total_net)}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+          <tfoot>
+            <tr class="font-semibold">
+              <td>30d total</td>
+              ${apps.map(a => {
+                const t = totals_by_app[a.id] || { net: 0 };
+                return `<td class="text-right font-mono">${fmtMoney(t.net)}</td>`;
+              }).join('')}
+              <td class="text-right font-mono">${fmtMoney(grand_total.net)}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+    `;
+  }
+
+  // Single-app view (or only one app configured) — compact list.
+  const visibleDays = daily.filter(d => {
+    const net = d.net_revenue ?? (d.revenue - d.refunds);
+    return Math.abs(net) > 0.005;
+  });
+  if (!visibleDays.length) {
+    return emptyState('No revenue activity in the last 30 days');
+  }
+  return `
+    <ul class="divide-y divide-ink-800">
+      ${visibleDays.slice().reverse().map(d => {
+        const net = d.net_revenue ?? (d.revenue - d.refunds);
+        const refundChip = d.refunds > 0
+          ? `<span class="text-xs text-red-300 ml-2">−${fmtMoney(d.refunds)} refunds</span>`
+          : '';
+        const netCls = net > 0 ? 'text-emerald-300'
+                     : net < 0 ? 'text-red-300' : 'text-ink-400';
+        return `
+          <li class="flex items-center justify-between py-2">
+            <div class="flex items-center gap-3">
+              <span class="text-sm">${formatDate(d.date)}</span>
+              <span class="text-xs text-ink-400">${d.date}</span>
+              ${refundChip}
+            </div>
+            <div class="text-right">
+              <div class="text-sm font-semibold font-mono ${netCls}">${fmtMoney(net)}</div>
+              <div class="text-xs text-ink-400">${fmtMoney(d.revenue)} gross${d.renewals ? ` · ${d.renewals} renewals` : ''}${d.new_subs ? ` · ${d.new_subs} new` : ''}</div>
+            </div>
+          </li>
+        `;
+      }).join('')}
+    </ul>
+  `;
+}
+
 function setTitle(title, sub) {
   $('#page-title').textContent = title;
   $('#page-sub').textContent = sub || '';
@@ -1081,8 +1273,12 @@ function renderNotifRow(n) {
 // REALTIME (SSE)
 // ============================================================
 
+let _sse = null;
 function startSse() {
-  const es = new EventSource('/sse/stream');
+  if (_sse) { try { _sse.close(); } catch (_) {} _sse = null; }
+  const url = STATE.appId ? `/sse/stream?app_id=${encodeURIComponent(STATE.appId)}` : '/sse/stream';
+  const es = new EventSource(url);
+  _sse = es;
   es.addEventListener('hello', () => {
     $('#live-dot').classList.add('live-on');
     $('#live-text').textContent = 'live';
@@ -1160,8 +1356,22 @@ async function route() {
 
 window.addEventListener('hashchange', route);
 $('#refresh-btn').addEventListener('click', route);
-route();
-startSse();
+
+// App selector — re-route + reconnect SSE on change.
+$('#app-select')?.addEventListener('change', (e) => {
+  STATE.appId = e.target.value || '';
+  if (STATE.appId) localStorage.setItem('rp.app_id', STATE.appId);
+  else localStorage.removeItem('rp.app_id');
+  startSse();
+  route();
+});
+
+// Initial bootstrap: load apps first, then route + open SSE.
+(async () => {
+  await loadApps();
+  route();
+  startSse();
+})();
 
 // auto refresh KPI cards every 60s on overview
 setInterval(() => {

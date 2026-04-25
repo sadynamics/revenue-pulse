@@ -70,6 +70,13 @@
           <h1 id="page-title" class="text-xl font-semibold">Overview</h1>
           <div id="page-sub" class="text-sm text-ink-400"></div>
           <div class="ml-auto flex items-center gap-3">
+            <label class="flex items-center gap-2 text-xs text-ink-400">
+              <span>App</span>
+              <select id="app-select"
+                      class="bg-ink-800 border border-ink-700 rounded-md text-ink-100 text-sm px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-brand-500">
+                <option value="">All apps</option>
+              </select>
+            </label>
             <button id="refresh-btn" class="btn-ghost text-sm">↻ Refresh</button>
             <span class="text-xs text-ink-400" id="last-updated">—</span>
           </div>

@@ -5,7 +5,7 @@ import { toUsd } from './fx.js';
 /**
  * Generic internal event shape (source-agnostic):
  * {
- *   event_id, type, app_user_id, original_app_user_id, aliases[],
+ *   event_id, app_id, type, app_user_id, original_app_user_id, aliases[],
  *   product_id, entitlement_ids[], period_type,
  *   purchased_at_ms, expiration_at_ms, event_timestamp_ms,
  *   environment, store, currency, price, price_usd,
@@ -28,6 +28,7 @@ export function buildEvent(src = {}) {
 
   return {
     event_id: src.event_id || null,
+    app_id: src.app_id || null,
     type: (src.type || 'UNKNOWN').toUpperCase(),
     subtype: src.subtype || null,
     app_user_id: src.app_user_id || src.original_app_user_id || null,
@@ -60,13 +61,13 @@ export function buildEvent(src = {}) {
 
 const insertEventStmt = db.prepare(`
   INSERT OR IGNORE INTO events (
-    event_id, type, app_user_id, original_app_user_id, aliases, product_id, entitlement_ids,
+    event_id, app_id, type, app_user_id, original_app_user_id, aliases, product_id, entitlement_ids,
     period_type, purchased_at_ms, expiration_at_ms, event_timestamp_ms, environment, store,
     currency, price, price_usd, country_code, is_family_share, is_trial_conversion,
     cancel_reason, expiration_reason, transaction_id, original_transaction_id,
     web_order_line_item_id, offer_code, raw_json, received_at_ms
   ) VALUES (
-    @event_id, @type, @app_user_id, @original_app_user_id, @aliases, @product_id, @entitlement_ids,
+    @event_id, @app_id, @type, @app_user_id, @original_app_user_id, @aliases, @product_id, @entitlement_ids,
     @period_type, @purchased_at_ms, @expiration_at_ms, @event_timestamp_ms, @environment, @store,
     @currency, @price, @price_usd, @country_code, @is_family_share, @is_trial_conversion,
     @cancel_reason, @expiration_reason, @transaction_id, @original_transaction_id,
@@ -74,23 +75,25 @@ const insertEventStmt = db.prepare(`
   )
 `);
 
-const getSubscriberStmt = db.prepare('SELECT * FROM subscribers WHERE app_user_id = ?');
+const getSubscriberStmt = db.prepare(
+  'SELECT * FROM subscribers WHERE app_id = ? AND app_user_id = ?'
+);
 
 const upsertSubscriberStmt = db.prepare(`
   INSERT INTO subscribers (
-    app_user_id, original_app_user_id, first_seen_ms, last_event_ms, status,
+    app_id, app_user_id, original_app_user_id, first_seen_ms, last_event_ms, status,
     current_product_id, current_entitlements, period_type, current_price_usd,
     expiration_ms, country_code, store, environment, will_renew,
     renewals_count, ltv_usd, refunded_usd, trial_converted, ever_trial,
     cancelled_at_ms, cancel_reason
   ) VALUES (
-    @app_user_id, @original_app_user_id, @first_seen_ms, @last_event_ms, @status,
+    @app_id, @app_user_id, @original_app_user_id, @first_seen_ms, @last_event_ms, @status,
     @current_product_id, @current_entitlements, @period_type, @current_price_usd,
     @expiration_ms, @country_code, @store, @environment, @will_renew,
     @renewals_count, @ltv_usd, @refunded_usd, @trial_converted, @ever_trial,
     @cancelled_at_ms, @cancel_reason
   )
-  ON CONFLICT(app_user_id) DO UPDATE SET
+  ON CONFLICT(app_id, app_user_id) DO UPDATE SET
     original_app_user_id = excluded.original_app_user_id,
     last_event_ms        = excluded.last_event_ms,
     status               = excluded.status,
@@ -113,13 +116,14 @@ const upsertSubscriberStmt = db.prepare(`
 `);
 
 const insertNotifStmt = db.prepare(`
-  INSERT INTO notifications (event_id, type, title, body, severity, amount_usd, app_user_id, product_id, created_at_ms)
-  VALUES (@event_id, @type, @title, @body, @severity, @amount_usd, @app_user_id, @product_id, @created_at_ms)
+  INSERT INTO notifications (event_id, app_id, type, title, body, severity, amount_usd, app_user_id, product_id, created_at_ms)
+  VALUES (@event_id, @app_id, @type, @title, @body, @severity, @amount_usd, @app_user_id, @product_id, @created_at_ms)
 `);
 
 function applyEventToSubscriber(existing, ev) {
   const now = ev.event_timestamp_ms;
   const base = existing || {
+    app_id: ev.app_id || '',
     app_user_id: ev.app_user_id,
     original_app_user_id: ev.original_app_user_id,
     first_seen_ms: now,
@@ -143,6 +147,7 @@ function applyEventToSubscriber(existing, ev) {
   };
 
   const sub = { ...base };
+  sub.app_id = ev.app_id || sub.app_id || '';
   sub.last_event_ms = now;
   sub.country_code = ev.country_code || sub.country_code;
   sub.store = ev.store || sub.store;
@@ -241,6 +246,7 @@ function buildNotification(ev, eventRowId) {
   const meta = map[ev.type] || { title: ev.type, severity: 'info', body: user };
   return {
     event_id: eventRowId,
+    app_id: ev.app_id || null,
     type: ev.type,
     title: meta.title,
     body: meta.body,
@@ -259,7 +265,7 @@ export const ingestEvent = db.transaction((normalizedEv) => {
   if (info.changes === 0) return { duplicate: true, event: ev };
 
   if (ev.app_user_id) {
-    const existing = getSubscriberStmt.get(ev.app_user_id);
+    const existing = getSubscriberStmt.get(ev.app_id || '', ev.app_user_id);
     const updated = applyEventToSubscriber(existing, ev);
     upsertSubscriberStmt.run(updated);
   }

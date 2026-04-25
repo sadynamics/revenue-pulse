@@ -9,26 +9,34 @@ import {
   fetchAppleSubscriptionState,
   resolveAppleAnchorTx,
 } from './backfill.js';
+import {
+  getApps,
+  getAppById,
+  isAppApiConfigured,
+} from './apps.js';
 
-const existingTxStmt = db.prepare('SELECT 1 AS x FROM events WHERE transaction_id = ? LIMIT 1');
-const activeSubscribersStmt = db.prepare(`
-  SELECT app_user_id, status, will_renew, expiration_ms, current_product_id
+const existingTxStmt = db.prepare(
+  'SELECT 1 AS x FROM events WHERE app_id = ? AND transaction_id = ? LIMIT 1'
+);
+const activeSubscribersForAppStmt = db.prepare(`
+  SELECT app_id, app_user_id, status, will_renew, expiration_ms, current_product_id
   FROM subscribers
-  WHERE status IN ('active', 'paused', 'billing_issue')
+  WHERE app_id = ?
+    AND status IN ('active', 'paused', 'billing_issue')
   ORDER BY last_event_ms DESC
   LIMIT ?
 `);
 
-function buildSyntheticDecoded({ notificationType, subtype = null, tx = null, renewal = null, environment = 'PRODUCTION' }) {
+function buildSyntheticDecoded({ notificationType, subtype = null, tx = null, renewal = null, environment = 'PRODUCTION', app }) {
   const seed = tx?.transactionId || tx?.originalTransactionId || cryptoRandomId();
   return {
     notificationType,
     subtype,
-    notificationUUID: `reconcile-${notificationType.toLowerCase()}-${seed}-${Date.now()}`,
+    notificationUUID: `reconcile-${app?.id || 'def'}-${notificationType.toLowerCase()}-${seed}-${Date.now()}`,
     version: '2.0',
     signedDate: Date.now(),
     data: {
-      bundleId: tx?.bundleId || process.env.APPSTORE_BUNDLE_ID || null,
+      bundleId: tx?.bundleId || app?.bundle_id || null,
       environment,
     },
     transactionInfo: tx,
@@ -40,8 +48,8 @@ function cryptoRandomId() {
   return Math.random().toString(36).slice(2, 12);
 }
 
-function ingestSynthetic(decoded) {
-  const internal = mapNotification(decoded);
+function ingestSynthetic(decoded, app) {
+  const internal = mapNotification(decoded, { appId: app?.id || null });
   let inserted = 0;
   let skipped = 0;
   for (const ev of internal) {
@@ -148,7 +156,7 @@ export function computeDrift(subscriber, appleStatuses = []) {
   };
 }
 
-async function repairSubscriptionDrift(subscriber, driftResult) {
+async function repairSubscriptionDrift(subscriber, driftResult, app) {
   const now = Date.now();
   const latestTx = driftResult.latest.latestTx;
   const latestRenewal = driftResult.latest.latestRenewal;
@@ -165,7 +173,8 @@ async function repairSubscriptionDrift(subscriber, driftResult) {
       tx: latestTx,
       renewal: latestRenewal,
       environment: env,
-    }));
+      app,
+    }), app);
     inserted += out.inserted;
     skipped += out.skipped;
     if (out.inserted) applied.push('EXPIRATION');
@@ -178,7 +187,8 @@ async function repairSubscriptionDrift(subscriber, driftResult) {
       tx: latestTx,
       renewal: latestRenewal || { autoRenewStatus: 0, productId: latestTx?.productId, originalTransactionId: latestTx?.originalTransactionId },
       environment: env,
-    }));
+      app,
+    }), app);
     inserted += out.inserted;
     skipped += out.skipped;
     if (out.inserted) applied.push('CANCELLATION');
@@ -191,7 +201,8 @@ async function repairSubscriptionDrift(subscriber, driftResult) {
       tx: latestTx,
       renewal: latestRenewal || { autoRenewStatus: 1, productId: latestTx?.productId, originalTransactionId: latestTx?.originalTransactionId },
       environment: env,
-    }));
+      app,
+    }), app);
     inserted += out.inserted;
     skipped += out.skipped;
     if (out.inserted) applied.push('UNCANCELLATION');
@@ -200,8 +211,8 @@ async function repairSubscriptionDrift(subscriber, driftResult) {
   return { inserted, skipped, applied };
 }
 
-async function reconcileMissingRefunds(anchorTx, environment) {
-  const signed = await getRefundHistory(anchorTx, { environment });
+async function reconcileMissingRefunds(anchorTx, environment, app) {
+  const signed = await getRefundHistory(anchorTx, { environment, app });
   let inserted = 0;
   let skipped = 0;
   let errors = 0;
@@ -213,7 +224,7 @@ async function reconcileMissingRefunds(anchorTx, environment) {
         errors++;
         continue;
       }
-      if (existingTxStmt.get(tx.transactionId)) {
+      if (existingTxStmt.get(app.id, tx.transactionId)) {
         skipped++;
         continue;
       }
@@ -225,7 +236,8 @@ async function reconcileMissingRefunds(anchorTx, environment) {
         notificationType: 'REFUND',
         tx: txForRefund,
         environment: (tx.environment || environment || 'PRODUCTION'),
-      }));
+        app,
+      }), app);
       inserted += out.inserted;
       skipped += out.skipped;
     } catch (err) {
@@ -235,25 +247,30 @@ async function reconcileMissingRefunds(anchorTx, environment) {
   return { fetched: signed.length, inserted, skipped, errors };
 }
 
-export async function reconcileUser(appUserId, { environment, repair = true } = {}) {
-  const subscriber = db.prepare(
-    'SELECT app_user_id, status, will_renew, expiration_ms, current_product_id FROM subscribers WHERE app_user_id = ?'
-  ).get(appUserId);
-  if (!subscriber) {
-    return { ok: false, app_user_id: appUserId, reason: 'not_found' };
+export async function reconcileUser(appUserId, { environment, repair = true, app } = {}) {
+  const targetApp = (typeof app === 'object' && app) ? app : (app ? getAppById(app) : null);
+  if (!targetApp) {
+    return { ok: false, app_user_id: appUserId, reason: 'no_app' };
   }
-  const anchor = resolveAppleAnchorTx(appUserId);
+  const subscriber = db.prepare(
+    'SELECT app_id, app_user_id, status, will_renew, expiration_ms, current_product_id FROM subscribers WHERE app_id = ? AND app_user_id = ?'
+  ).get(targetApp.id, appUserId);
+  if (!subscriber) {
+    return { ok: false, app_user_id: appUserId, app_id: targetApp.id, reason: 'not_found' };
+  }
+  const anchor = resolveAppleAnchorTx(appUserId, targetApp.id);
   if (!anchor) {
-    return { ok: false, app_user_id: appUserId, reason: 'no_anchor_transaction' };
+    return { ok: false, app_user_id: appUserId, app_id: targetApp.id, reason: 'no_anchor_transaction' };
   }
 
-  const apple = await fetchAppleSubscriptionState(anchor, { environment });
+  const apple = await fetchAppleSubscriptionState(anchor, { environment, app: targetApp });
   const drift = computeDrift(subscriber, apple.statuses || []);
-  const repairResult = repair ? await repairSubscriptionDrift(subscriber, drift) : { inserted: 0, skipped: 0, applied: [] };
-  const refunds = await reconcileMissingRefunds(anchor, environment);
+  const repairResult = repair ? await repairSubscriptionDrift(subscriber, drift, targetApp) : { inserted: 0, skipped: 0, applied: [] };
+  const refunds = await reconcileMissingRefunds(anchor, environment, targetApp);
 
   return {
     ok: true,
+    app_id: targetApp.id,
     app_user_id: appUserId,
     anchor,
     drift: drift.drift,
@@ -275,38 +292,68 @@ export function getReconcileState() {
   return { ...reconcileState };
 }
 
-export async function runReconcile({ limit = 200, repair = true, environment } = {}) {
-  if (!appstoreConfigured()) throw new Error('appstore_api_not_configured');
+export async function runReconcile({ limit = 200, repair = true, environment, app } = {}) {
   if (reconcileState.running) throw new Error('reconcile_already_running');
+
+  // Determine which apps to reconcile
+  const apps = (() => {
+    if (app) {
+      const a = typeof app === 'object' ? app : getAppById(app);
+      return a ? [a] : [];
+    }
+    return getApps().filter(isAppApiConfigured);
+  })();
+
+  if (!apps.length) throw new Error('appstore_api_not_configured');
 
   reconcileState.running = true;
   reconcileState.last_started_at = Date.now();
   reconcileState.last_error = null;
 
   try {
-    const candidates = activeSubscribersStmt.all(limit);
     const summary = {
-      users: candidates.length,
+      apps: apps.length,
+      users: 0,
       checked: 0,
       drifted: 0,
       repaired_events: 0,
       refund_events: 0,
       errors: 0,
+      per_app: {},
       started_at: reconcileState.last_started_at,
       finished_at: null,
     };
 
-    for (const c of candidates) {
-      try {
-        const out = await reconcileUser(c.app_user_id, { environment, repair });
-        summary.checked++;
-        if (out.ok && out.drift?.has_drift) summary.drifted++;
-        summary.repaired_events += out.repairs?.inserted || 0;
-        summary.refund_events += out.refunds?.inserted || 0;
-      } catch (err) {
-        summary.errors++;
+    for (const targetApp of apps) {
+      const candidates = activeSubscribersForAppStmt.all(targetApp.id, limit);
+      const sub = {
+        users: candidates.length,
+        checked: 0,
+        drifted: 0,
+        repaired_events: 0,
+        refund_events: 0,
+        errors: 0,
+      };
+      for (const c of candidates) {
+        try {
+          const out = await reconcileUser(c.app_user_id, { environment, repair, app: targetApp });
+          sub.checked++;
+          if (out.ok && out.drift?.has_drift) sub.drifted++;
+          sub.repaired_events += out.repairs?.inserted || 0;
+          sub.refund_events += out.refunds?.inserted || 0;
+        } catch (err) {
+          sub.errors++;
+        }
       }
+      summary.per_app[targetApp.id] = sub;
+      summary.users += sub.users;
+      summary.checked += sub.checked;
+      summary.drifted += sub.drifted;
+      summary.repaired_events += sub.repaired_events;
+      summary.refund_events += sub.refund_events;
+      summary.errors += sub.errors;
     }
+
     summary.finished_at = Date.now();
     reconcileState.last_finished_at = summary.finished_at;
     reconcileState.last_result = summary;
@@ -332,7 +379,7 @@ export function startReconcileScheduler() {
     try {
       const result = await runReconcile({ limit, repair: true });
       console.log(
-        `[reconcile] users=${result.users} checked=${result.checked} drifted=${result.drifted} repaired=${result.repaired_events} refunds=${result.refund_events} errors=${result.errors}`
+        `[reconcile] apps=${result.apps} users=${result.users} checked=${result.checked} drifted=${result.drifted} repaired=${result.repaired_events} refunds=${result.refund_events} errors=${result.errors}`
       );
     } catch (err) {
       if (err.message !== 'reconcile_already_running') {
@@ -343,6 +390,6 @@ export function startReconcileScheduler() {
 
   setTimeout(() => void tick(), 20_000);
   const timer = setInterval(() => void tick(), intervalMs);
-  console.log(`[reconcile] scheduler enabled: every ${hours}h, batch_limit=${limit}`);
+  console.log(`[reconcile] scheduler enabled: every ${hours}h, batch_limit=${limit}, apps=all-configured`);
   return timer;
 }

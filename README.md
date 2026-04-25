@@ -30,6 +30,7 @@ Webhook'lar JWS olarak gelir, imzası doğrulanır, içindeki `signedTransaction
 - **🛰 Drift detection** – Subscriber modalında local state vs Apple canlı state karşılaştırması (`autoRenewStatus`, `expiresDate`) ve drift uyarıları
 - **🛠 Daily reconcile job** – Aktif kullanıcıları periyodik tarayıp kaçan `EXPIRATION` / `CANCELLATION` / `REFUND` event'lerini otomatik düzeltir
 - **🧪 Apple test notification trigger** – Dashboard'dan doğrudan App Store Server API `notifications/test` çağrısı (Sandbox/Production seçimi)
+- **📦 Multi-app desteği** – Aynı dashboard'dan birden fazla uygulamayı izleme. Webhook'lar `bundleId`'ye göre otomatik route edilir; UI üst barındaki **App** dropdown'undan filtre. Her app kendi App Store Server API credential'larını kullanır.
 
 ## Mimari
 
@@ -61,6 +62,102 @@ Canlı notification simülatörü (başka bir terminalden):
 ```bash
 npm run simulate -- --interval 3000
 ```
+
+## Multi-app (birden fazla uygulamayı tek panelden izleme)
+
+Aynı dashboard'dan birden fazla uygulama takip edebilirsiniz. Tek webhook URL'si tüm app'ler için kullanılır; gelen notification içindeki `data.bundleId` değeri ile doğru app'e route edilir.
+
+### Konfigürasyon
+
+Apple App Store Server API key'i Developer team'ine bağlıdır — aynı team'deki tüm app'ler için **tek bir credential set'i** yeterli. O yüzden tipik kurulum şöyledir:
+
+1. **Bir kere** `APPSTORE_ISSUER_ID` / `APPSTORE_KEY_ID` / `APPSTORE_PRIVATE_KEY` (veya `APPSTORE_PRIVATE_KEY_PATH`) env'lerini doldurun.
+2. **Her app için** sadece `id` + `bundle_id` (+ opsiyonel `name`/`environment`) listeleyin:
+
+```bash
+APPS_CONFIG='[
+  {"id":"myapp",   "name":"MyApp",      "bundle_id":"com.acme.myapp"},
+  {"id":"otherapp","name":"OtherApp",   "bundle_id":"com.acme.other","environment":"Sandbox"}
+]'
+```
+
+Bu kadar — credential'lar otomatik tüm app'lere paylaştırılır.
+
+#### Per-app override (farklı team'deki app'ler için)
+
+Bir app farklı bir Developer team'indeyse, sadece o app için `issuer_id` / `key_id` / `private_key` (veya `private_key_path`) ekleyebilirsiniz:
+
+```bash
+APPS_CONFIG='[
+  {"id":"myapp", "bundle_id":"com.acme.myapp"},
+  {
+    "id": "otherteam-app",
+    "bundle_id": "com.otherteam.app",
+    "issuer_id": "11111111-1111-1111-1111-111111111111",
+    "key_id": "ZZZZZZ9999",
+    "private_key": "-----BEGIN PRIVATE KEY-----\nMIG...\n-----END PRIVATE KEY-----\n"
+  }
+]'
+```
+
+Per-app alanlar (referans):
+
+| Alan | Zorunlu | Açıklama |
+|---|---|---|
+| `id` | ✅ | İçeride kullanılan kararlı kimlik (URL-safe, kısa). |
+| `bundle_id` | ✅ | Apple bundle identifier — webhook routing key'i. |
+| `name` | — | UI'da görünecek isim (default = `id`). |
+| `environment` | — | `Production` / `Sandbox` (default `Production`). |
+| `issuer_id`, `key_id` | — | App Store Server API credential override. Yoksa global `APPSTORE_*` env kullanılır. |
+| `private_key` | — | `.p8` PEM içeriği (newline'lar `\n` literal olabilir). |
+| `private_key_path` | — | `.p8` dosya yolu. `private_key` veya bu — ikisinden biri yeterli. |
+
+### Eski tek-app ayarı (geriye uyumluluk)
+
+`APPS_CONFIG` set edilmezse eski `APPSTORE_BUNDLE_ID` / `APPSTORE_ENVIRONMENT` / `APPSTORE_ISSUER_ID` / `APPSTORE_KEY_ID` / `APPSTORE_PRIVATE_KEY[_PATH]` değişkenleri okunur ve default app olarak yüklenir. Yani tek app kullanan mevcut deploy'lar hiçbir şey değiştirmek zorunda değil.
+
+### Webhook routing & strict mode
+
+- Apple `signedPayload` decode edilir, içindeki `data.bundleId` ile `APPS_CONFIG`'teki `bundle_id` eşleşir.
+- Eşleşme yoksa **default app**'e (registry'deki ilk app) düşer ve `[webhook] unknown bundleId ... falling back to default` warning loglanır.
+- Bilinmeyen bundle'lardan gelen webhook'ları reddetmek için `STRICT_BUNDLE_ID=true` set edin (HTTP 400 döner).
+- App Store Connect'te her uygulamada aynı webhook URL'i kullanılabilir, çünkü routing payload içeriğinden yapılır.
+
+### UI
+
+Dashboard üst barında bir **App** dropdown'u görünür. Birden fazla app varsa:
+
+- **All apps** → tüm metrikler agregate.
+- Tek app seçilirse → KPI, subscriber listesi, daily revenue, MRR, breakdown'lar, event feed ve canlı SSE stream tamamen o `app_id` ile filtrelenir. Seçim `localStorage`'da tutulur.
+
+### Scriptler
+
+```bash
+# Tek app için backfill
+npm run backfill -- --app myapp-prod
+
+# Tüm konfigüre app'ler için backfill
+npm run backfill
+
+# Tek app için reconcile
+npm run reconcile -- --app myapp-prod
+
+# Belirli bir app'e doğru webhook simulator
+npm run simulate -- --app myapp-sandbox --bundle com.acme.myapp.sandbox
+```
+
+### API filtresi
+
+Tüm read endpoint'leri opsiyonel `app_id` query parametresi alır:
+
+```
+GET /api/metrics?app_id=myapp-prod
+GET /api/subscribers?app_id=myapp-prod&q=...
+GET /api/daily?days=30&app_id=myapp-prod
+GET /sse/stream?app_id=myapp-prod
+```
+
+`GET /api/apps` konfigüre edilen tüm app'lerin listesini döner (UI dropdown'u bunu kullanır).
 
 ## App Store Connect'te webhook ayarı
 
@@ -192,25 +289,27 @@ History endpoint'i tüm IAP tiplerini döner:
 1. Bu repoyu GitHub'a pushla.
 2. Railway → **New Project** → **Deploy from GitHub** → repoyu seç.
 3. Environment variables:
-   - `APPSTORE_BUNDLE_ID=com.senin.app`
-   - `APPSTORE_ENVIRONMENT=Production`
+   - **Tek app:** `APPSTORE_BUNDLE_ID=com.senin.app`, `APPSTORE_ENVIRONMENT=Production`
+   - **Çoklu app:** `APPS_CONFIG='[{"id":"app1",...},{"id":"app2",...}]'` (yukarıdaki Multi-app bölümüne bak)
    - `APPSTORE_SKIP_VERIFICATION=false`
+   - `STRICT_BUNDLE_ID=false` (true → bilinmeyen bundle'ları reject et)
    - `DASHBOARD_USER=admin`
    - `DASHBOARD_PASS=strongpass`
    - `DB_PATH=/data/revenue.db`  *(volume kalıcılığı için)*
    - (opsiyonel) `APPLE_ROOT_CERT_PATH=/app/certs/AppleRootCA-G3.pem` + cert'i repoya commit et.
 4. **Volumes** sekmesinden `/data`'ya volume bağla.
 5. Deploy. Health check: `/healthz`.
-6. App Store Connect'te webhook URL'i production domain'e point et.
+6. App Store Connect'te her uygulamada aynı webhook URL'i kullanın — routing payload içeriğinden otomatik yapılır.
 
 ## Endpoint'ler
 
 | Endpoint | Açıklama |
 |---|---|
-| `POST /webhook`                   | Apple signedPayload kabul eder (JWS verify edilir) |
-| `POST /webhook/test`              | Dev test — imza olmadan decoded notification ya da internal event kabul eder |
-| `GET  /sse/stream`                | Canlı bildirim akışı (SSE) |
-| `GET  /api/config`                | App Store Server API'nin konfigüre olup olmadığını döner |
+| `POST /webhook`                   | Apple signedPayload kabul eder (JWS verify edilir, bundleId → app routing) |
+| `POST /webhook/test`              | Dev test — imza olmadan decoded notification ya da internal event kabul eder (`?app_id=` ile override) |
+| `GET  /sse/stream?app_id=`        | Canlı bildirim akışı (SSE), opsiyonel app filtresi |
+| `GET  /api/apps`                  | Konfigüre edilen tüm app'lerin listesi (UI dropdown'u için) |
+| `GET  /api/config`                | App Store Server API konfig durumu (seçili app için) |
 | `POST /api/subscribers/:id/sync`  | Kullanıcının tüm geçmiş transaction'larını Apple'dan çek + ingest et |
 | `GET  /api/subscribers/:id/apple-status` | Apple canlı state + local state drift analizi (`has_drift`, issue listesi) |
 | `POST /api/appstore/test-notification` | Apple'a TEST notification gönderimini tetikler (Sandbox/Production) |
@@ -234,6 +333,8 @@ History endpoint'i tüm IAP tiplerini döner:
 | `GET  /api/notifications`         | Son 50 bildirim |
 | `GET  /api/summary`               | Overview için toplu response |
 | `GET  /healthz`                   | Health check |
+
+> Read endpoint'lerinin tamamı (metrics, subscribers, events, daily, mrr-history, products, countries, stores, churn-reasons, top-subscribers, upcoming-renewals, notifications, summary, renewals) opsiyonel `?app_id=<id>` query parametresini kabul eder. Verilmezse tüm app'ler için agregate sonuç döner.
 
 ## Sınırlamalar / notlar
 

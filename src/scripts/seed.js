@@ -1,6 +1,18 @@
 import 'dotenv/config';
 import { processEvent } from '../services/events.js';
 import { mapNotification } from '../services/appstore.js';
+import { reloadApps, getDefaultApp } from '../services/apps.js';
+
+// Ensure apps registry is populated; seeded events are tagged with the default
+// app so they show up under the configured app in the UI.
+reloadApps();
+const SEED_APP = getDefaultApp() || {
+  id: 'demo',
+  name: 'Demo',
+  bundle_id: 'com.acme.app',
+  environment: 'Production',
+};
+console.log(`Seeding under app="${SEED_APP.id}" (bundle_id=${SEED_APP.bundle_id})`);
 
 /**
  * 90 günlük App Store Server Notifications V2 demo data üretir.
@@ -28,7 +40,7 @@ function makeNotification({ notificationType, subtype, product, originalTxId, ap
     transactionId: txId,
     originalTransactionId: originalTxId,
     webOrderLineItemId: weOrderId,
-    bundleId: 'com.acme.app',
+    bundleId: SEED_APP.bundle_id,
     productId: product.id,
     subscriptionGroupIdentifier: product.group,
     purchaseDate: timestamp,
@@ -67,7 +79,7 @@ function makeNotification({ notificationType, subtype, product, originalTxId, ap
     signedDate: timestamp,
     data: {
       appAppleId: 1234567890,
-      bundleId: 'com.acme.app',
+      bundleId: SEED_APP.bundle_id,
       bundleVersion: '1.0',
       environment: 'Production',
     },
@@ -77,7 +89,7 @@ function makeNotification({ notificationType, subtype, product, originalTxId, ap
 }
 
 function ingestApple(notification) {
-  const events = mapNotification(notification);
+  const events = mapNotification(notification, { appId: SEED_APP.id });
   for (const ev of events) processEvent(ev);
 }
 

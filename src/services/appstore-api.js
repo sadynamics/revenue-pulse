@@ -1,26 +1,18 @@
 import crypto from 'node:crypto';
-import { readFileSync, existsSync } from 'node:fs';
+import { getAppById, getDefaultApp, isAppApiConfigured } from './apps.js';
 
 /**
- * App Store Server API client.
+ * App Store Server API client (multi-app capable).
+ *
+ * Each app is configured via the apps registry (see `src/services/apps.js`):
+ *   { id, bundle_id, environment, issuer_id, key_id, private_key }
+ *
+ * Public methods take an `app` object (or app id string). When omitted, the
+ * default (first configured) app is used. JWT bearer tokens are cached per app.
  *
  * Docs:
  *  - https://developer.apple.com/documentation/appstoreserverapi
  *  - https://developer.apple.com/documentation/appstoreserverapi/creating_api_keys_to_use_with_the_app_store_server_api
- *
- * Required env:
- *   APPSTORE_ISSUER_ID         (UUID; App Store Connect → Users and Access → Integrations)
- *   APPSTORE_KEY_ID            (10-char ID for the In-App Purchase API key)
- *   APPSTORE_PRIVATE_KEY       (.p8 PEM string)  *or*
- *   APPSTORE_PRIVATE_KEY_PATH  (path to the .p8 file)
- *   APPSTORE_BUNDLE_ID         (e.g. com.acme.app)
- *   APPSTORE_ENVIRONMENT       ("Production" | "Sandbox", default Production)
- *
- * Notes:
- *  - Apple supports two parallel environments. Sandbox has its own API host and tokens.
- *  - Tokens are short-lived (≤60 min). We cache for ~20 min.
- *  - Each transaction in history is itself a JWS signed by Apple. We decode them with the
- *    same JWS utilities used for incoming notifications.
  */
 
 const HOSTS = {
@@ -29,39 +21,31 @@ const HOSTS = {
 };
 
 function normalizeEnvironment(env) {
-  return (env || process.env.APPSTORE_ENVIRONMENT || 'Production').toUpperCase() === 'SANDBOX'
-    ? 'SANDBOX'
-    : 'PRODUCTION';
+  return (env || 'Production').toUpperCase() === 'SANDBOX' ? 'SANDBOX' : 'PRODUCTION';
 }
 
-function host(envOverride) {
-  const env = normalizeEnvironment(envOverride);
-  return env === 'SANDBOX' ? HOSTS.SANDBOX : HOSTS.PRODUCTION;
+function host(env) {
+  return normalizeEnvironment(env) === 'SANDBOX' ? HOSTS.SANDBOX : HOSTS.PRODUCTION;
 }
 
-function loadPrivateKey() {
-  const inline = process.env.APPSTORE_PRIVATE_KEY;
-  if (inline && inline.includes('BEGIN')) {
-    return inline.replace(/\\n/g, '\n');
+function resolveApp(appOrId) {
+  if (!appOrId) return getDefaultApp();
+  if (typeof appOrId === 'string') return getAppById(appOrId);
+  return appOrId; // assume already a normalized app object
+}
+
+/** True if at least one app has full API credentials. */
+export function isConfigured(appOrId) {
+  if (appOrId === undefined) {
+    const app = getDefaultApp();
+    return !!app && isAppApiConfigured(app);
   }
-  const path = process.env.APPSTORE_PRIVATE_KEY_PATH;
-  if (path && existsSync(path)) {
-    return readFileSync(path, 'utf8');
-  }
-  return null;
-}
-
-export function isConfigured() {
-  return !!(
-    process.env.APPSTORE_ISSUER_ID &&
-    process.env.APPSTORE_KEY_ID &&
-    process.env.APPSTORE_BUNDLE_ID &&
-    loadPrivateKey()
-  );
+  const app = resolveApp(appOrId);
+  return !!app && isAppApiConfigured(app);
 }
 
 // ---------------------------------------------------------------
-// JWT bearer token (ES256, signed with the .p8 key)
+// JWT bearer token (ES256, signed with each app's .p8 key)
 // ---------------------------------------------------------------
 
 function b64url(buf) {
@@ -72,40 +56,39 @@ function b64url(buf) {
     .replace(/\//g, '_');
 }
 
-let cachedToken = null;
+const tokenCache = new Map(); // appId -> { token, exp }
 
-function generateToken() {
-  if (cachedToken && cachedToken.exp > Date.now() / 1000 + 60) {
-    return cachedToken.token;
-  }
-  if (!isConfigured()) {
-    throw new Error('appstore_api_not_configured: set APPSTORE_ISSUER_ID, APPSTORE_KEY_ID, APPSTORE_PRIVATE_KEY[_PATH], APPSTORE_BUNDLE_ID');
+function generateToken(app) {
+  if (!app) throw new Error('appstore_api_no_app');
+  if (!isAppApiConfigured(app)) {
+    throw new Error(`appstore_api_not_configured: app "${app.id}" is missing issuer_id, key_id, private_key or bundle_id`);
   }
 
-  const header = {
-    alg: 'ES256',
-    kid: process.env.APPSTORE_KEY_ID,
-    typ: 'JWT',
-  };
+  const cached = tokenCache.get(app.id);
+  if (cached && cached.exp > Date.now() / 1000 + 60) {
+    return cached.token;
+  }
+
+  const header = { alg: 'ES256', kid: app.key_id, typ: 'JWT' };
   const now = Math.floor(Date.now() / 1000);
   const exp = now + 20 * 60;
   const payload = {
-    iss: process.env.APPSTORE_ISSUER_ID,
+    iss: app.issuer_id,
     iat: now,
     exp,
     aud: 'appstoreconnect-v1',
-    bid: process.env.APPSTORE_BUNDLE_ID,
+    bid: app.bundle_id,
   };
 
   const h = b64url(JSON.stringify(header));
   const p = b64url(JSON.stringify(payload));
   const signingInput = Buffer.from(`${h}.${p}`);
-  const key = crypto.createPrivateKey(loadPrivateKey());
+  const key = crypto.createPrivateKey(app.private_key);
   const der = crypto.sign('SHA256', signingInput, key);
   const raw = ecdsaDerToRaw(der);
   const token = `${h}.${p}.${b64url(raw)}`;
 
-  cachedToken = { token, exp };
+  tokenCache.set(app.id, { token, exp });
   return token;
 }
 
@@ -122,7 +105,6 @@ function ecdsaDerToRaw(der) {
   const sLen = der[i + 1];
   let s = der.slice(i + 2, i + 2 + sLen);
 
-  // Strip leading zeroes (DER) and left-pad to 32 bytes (raw).
   while (r.length > 32 && r[0] === 0) r = r.slice(1);
   while (s.length > 32 && s[0] === 0) s = s.slice(1);
   const rPad = Buffer.concat([Buffer.alloc(32 - r.length, 0), r]);
@@ -134,30 +116,37 @@ function ecdsaDerToRaw(der) {
 // HTTP helpers
 // ---------------------------------------------------------------
 
-async function appleRequest(method, path, { query = {}, body, environment } = {}) {
-  const url = new URL(`${host(environment)}${path}`);
+async function appleRequest(method, path, { app, query = {}, body, environment } = {}) {
+  const resolvedApp = resolveApp(app);
+  if (!resolvedApp) throw new Error('appstore_api_no_app');
+
+  const env = environment || resolvedApp.environment;
+  const url = new URL(`${host(env)}${path}`);
   for (const [k, v] of Object.entries(query)) {
     if (v != null) url.searchParams.set(k, String(v));
   }
   const headers = {
-    authorization: `Bearer ${generateToken()}`,
+    authorization: `Bearer ${generateToken(resolvedApp)}`,
     accept: 'application/json',
   };
   if (body != null) headers['content-type'] = 'application/json';
   const res = await fetch(url, {
     method,
-    headers: {
-      ...headers,
-    },
+    headers,
     body: body != null ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
   let parsed;
   try { parsed = JSON.parse(text); } catch (_) { parsed = text; }
   if (!res.ok) {
-    const err = new Error(`appstore_api_${res.status}: ${typeof parsed === 'string' ? parsed : (parsed.errorMessage || JSON.stringify(parsed))}`);
+    const err = new Error(
+      `appstore_api_${res.status}: ${
+        typeof parsed === 'string' ? parsed : (parsed.errorMessage || JSON.stringify(parsed))
+      }`
+    );
     err.status = res.status;
     err.body = parsed;
+    err.app_id = resolvedApp.id;
     throw err;
   }
   return parsed;
@@ -172,39 +161,17 @@ async function applePost(path, body = {}, opts = {}) {
 }
 
 // ---------------------------------------------------------------
-// Public API
+// Public API (each accepts { app, environment, ... } where app is the app id or object)
 // ---------------------------------------------------------------
 
-/**
- * Get a single transaction by ID.
- * Response: { signedTransactionInfo: <JWS> }
- *
- * https://developer.apple.com/documentation/appstoreserverapi/get_transaction_info
- */
-export async function getTransactionInfo(transactionId) {
-  return appleGet(`/inApps/v1/transactions/${encodeURIComponent(transactionId)}`);
+export async function getTransactionInfo(transactionId, opts = {}) {
+  return appleGet(
+    `/inApps/v1/transactions/${encodeURIComponent(transactionId)}`,
+    {},
+    opts
+  );
 }
 
-/**
- * Get a user's full transaction history (all in-app purchases — subscriptions,
- * one-time, consumable, lifetime — sorted by purchase date).
- *
- * Pass *any* transactionId belonging to that user (originalTransactionId is the
- * canonical anchor; any tx in the chain works). The API resolves the family.
- *
- * Pagination via `revision`. We loop until !hasMore and return all signedTransactions.
- *
- * https://developer.apple.com/documentation/appstoreserverapi/get_transaction_history
- *
- * @param {string} transactionId  any transactionId (originalTransactionId preferred)
- * @param {object} opts
- *   - sort: 'ASCENDING' | 'DESCENDING' (default 'ASCENDING')
- *   - productType: 'AUTO_RENEWABLE' | 'NON_RENEWABLE' | 'CONSUMABLE' | 'NON_CONSUMABLE'
- *   - startDate, endDate: ms timestamps
- *   - revoked: 'true' | 'false'
- *   - inAppOwnershipType: 'FAMILY_SHARED' | 'PURCHASED'
- *   - maxPages: safety cap (default 20 → up to 400 transactions/user)
- */
 export async function getTransactionHistory(transactionId, opts = {}) {
   const all = [];
   let revision = opts.revision || null;
@@ -220,7 +187,7 @@ export async function getTransactionHistory(transactionId, opts = {}) {
       endDate: opts.endDate,
       revoked: opts.revoked,
       inAppOwnershipType: opts.inAppOwnershipType,
-    }, { environment: opts.environment });
+    }, { app: opts.app, environment: opts.environment });
 
     if (Array.isArray(data.signedTransactions)) {
       all.push(...data.signedTransactions);
@@ -234,23 +201,14 @@ export async function getTransactionHistory(transactionId, opts = {}) {
   return all;
 }
 
-/**
- * Get the *current* subscription status for a user — for each subscription group,
- * the latest transaction + auto-renew info. Useful for verifying our local state.
- *
- * https://developer.apple.com/documentation/appstoreserverapi/get_all_subscription_statuses
- */
 export async function getSubscriptionStatuses(transactionId, opts = {}) {
-  return appleGet(`/inApps/v1/subscriptions/${encodeURIComponent(transactionId)}`, {
-    status: opts.status, // optional filter
-  }, { environment: opts.environment });
+  return appleGet(
+    `/inApps/v1/subscriptions/${encodeURIComponent(transactionId)}`,
+    { status: opts.status },
+    { app: opts.app, environment: opts.environment }
+  );
 }
 
-/**
- * Get refund history for a user (all refunded transactions).
- *
- * https://developer.apple.com/documentation/appstoreserverapi/get_refund_history
- */
 export async function getRefundHistory(transactionId, opts = {}) {
   const all = [];
   let revision = opts.revision || null;
@@ -260,7 +218,7 @@ export async function getRefundHistory(transactionId, opts = {}) {
   while (true) {
     const data = await appleGet(`/inApps/v2/refund/lookup/${encodeURIComponent(transactionId)}`, {
       revision: revision || undefined,
-    }, { environment: opts.environment });
+    }, { app: opts.app, environment: opts.environment });
     if (Array.isArray(data.signedTransactions)) {
       all.push(...data.signedTransactions);
     }
@@ -272,29 +230,14 @@ export async function getRefundHistory(transactionId, opts = {}) {
   return all;
 }
 
-/**
- * Ask Apple to send a signed TEST notification to your configured App Store
- * Server Notification URL.
- *
- * Environment is selected by API host:
- *  - Sandbox host => Sandbox test notification
- *  - Production host => Production test notification
- *
- * Returns: { testNotificationToken: "..." }
- */
-export async function requestTestNotification({ environment } = {}) {
-  return applePost('/inApps/v1/notifications/test', {}, { environment });
+export async function requestTestNotification(opts = {}) {
+  return applePost('/inApps/v1/notifications/test', {}, opts);
 }
 
-/**
- * Poll test notification result by token.
- *
- * Returns Apple's delivery result to your webhook endpoint.
- */
-export async function getTestNotificationStatus(testNotificationToken, { environment } = {}) {
+export async function getTestNotificationStatus(testNotificationToken, opts = {}) {
   return appleGet(
     `/inApps/v1/notifications/test/${encodeURIComponent(testNotificationToken)}`,
     {},
-    { environment }
+    opts
   );
 }

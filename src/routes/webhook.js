@@ -3,19 +3,18 @@ import { readFileSync, existsSync } from 'node:fs';
 import { processEvent } from '../services/events.js';
 import { decodeNotification, mapNotification } from '../services/appstore.js';
 import { maybeBackfillInBackground } from '../services/backfill.js';
+import { resolveAppForBundleId, getApps } from '../services/apps.js';
 
 export const webhook = Router();
 
-// Apple Root CA sertifikası — verification için. Opsiyonel; sağlanırsa x5c zinciri buna
-// kadar doğrulanır. Yoksa sadece imza (leaf cert) doğrulaması yapılır.
+// Apple Root CA — optional, used for full x5c chain verification.
 let APPLE_ROOT_CERT_PEM = null;
 if (process.env.APPLE_ROOT_CERT_PATH && existsSync(process.env.APPLE_ROOT_CERT_PATH)) {
   APPLE_ROOT_CERT_PEM = readFileSync(process.env.APPLE_ROOT_CERT_PATH, 'utf8');
 }
 
 const SKIP_VERIFICATION = /^(1|true|yes)$/i.test(process.env.APPSTORE_SKIP_VERIFICATION || '');
-const EXPECTED_BUNDLE_ID = process.env.APPSTORE_BUNDLE_ID || null;
-const EXPECTED_ENV = (process.env.APPSTORE_ENVIRONMENT || '').toUpperCase();
+const STRICT_BUNDLE_ID = /^(1|true|yes)$/i.test(process.env.STRICT_BUNDLE_ID || '');
 
 function handleAppleNotification(signedPayload, { verify }) {
   if (!signedPayload || typeof signedPayload !== 'string') {
@@ -36,18 +35,36 @@ function handleAppleNotification(signedPayload, { verify }) {
     throw err;
   }
 
-  // Bundle id ve environment kontrolü (yanlış app'ten gelen notification'ları reddet)
-  if (EXPECTED_BUNDLE_ID && decoded.data?.bundleId && decoded.data.bundleId !== EXPECTED_BUNDLE_ID) {
-    const err = new Error(`bundle_id_mismatch: got ${decoded.data.bundleId}`);
+  // Resolve which app this notification belongs to via bundleId.
+  const bundleId = decoded.data?.bundleId || null;
+  const app = resolveAppForBundleId(bundleId, { strict: STRICT_BUNDLE_ID });
+  if (!app) {
+    const apps = getApps();
+    const reason = apps.length === 0
+      ? 'no_apps_configured'
+      : `bundle_id_unrecognized: ${bundleId}`;
+    const err = new Error(reason);
     err.status = 400;
     throw err;
   }
-  if (EXPECTED_ENV && decoded.data?.environment && decoded.data.environment.toUpperCase() !== EXPECTED_ENV) {
-    // Uyarı olarak logla ama reddetme (sandbox test'lerinde prod endpoint'e gelebilir)
-    console.warn(`[webhook] environment mismatch: expected=${EXPECTED_ENV} got=${decoded.data.environment}`);
+  if (bundleId && bundleId !== app.bundle_id && STRICT_BUNDLE_ID) {
+    const err = new Error(`bundle_id_mismatch: got ${bundleId}, expected ${app.bundle_id}`);
+    err.status = 400;
+    throw err;
+  }
+  if (bundleId && bundleId !== app.bundle_id) {
+    console.warn(`[webhook] routed by default app (${app.id}); incoming bundleId=${bundleId}`);
   }
 
-  const internal = mapNotification(decoded);
+  if (app.environment && decoded.data?.environment) {
+    const expected = app.environment.toUpperCase() === 'SANDBOX' ? 'SANDBOX' : 'PRODUCTION';
+    const got = (decoded.data.environment || '').toUpperCase() === 'SANDBOX' ? 'SANDBOX' : 'PRODUCTION';
+    if (expected !== got) {
+      console.warn(`[webhook] env mismatch for app=${app.id} expected=${expected} got=${got}`);
+    }
+  }
+
+  const internal = mapNotification(decoded, { appId: app.id });
   const results = [];
   let insertedCount = 0;
   for (const ev of internal) {
@@ -56,16 +73,13 @@ function handleAppleNotification(signedPayload, { verify }) {
     if (!r.duplicate) insertedCount++;
   }
 
-  // If this is the first time we've seen this Apple user, fetch their full purchase
-  // history (auto-renewable + non-renewing + lifetime + consumables) from the App
-  // Store Server API so the dashboard isn't blind to anything that happened before
-  // we deployed. Runs in the background; webhook responds 200 either way.
+  // Background-backfill new users so we can show pre-deploy history.
   const otid = internal[0]?.original_transaction_id;
   if (otid && insertedCount > 0) {
-    maybeBackfillInBackground(otid, insertedCount);
+    maybeBackfillInBackground(otid, insertedCount, app);
   }
 
-  return { decoded, results };
+  return { decoded, results, app };
 }
 
 /**
@@ -76,12 +90,13 @@ function handleAppleNotification(signedPayload, { verify }) {
 webhook.post('/', (req, res) => {
   try {
     const { signedPayload } = req.body || {};
-    const { decoded, results } = handleAppleNotification(signedPayload, {
+    const { decoded, results, app } = handleAppleNotification(signedPayload, {
       verify: !SKIP_VERIFICATION,
     });
     const duplicates = results.filter(r => r.duplicate).length;
     return res.status(200).json({
       ok: true,
+      app_id: app.id,
       notificationType: decoded.notificationType,
       subtype: decoded.subtype,
       notificationUUID: decoded.notificationUUID,
@@ -95,26 +110,48 @@ webhook.post('/', (req, res) => {
 });
 
 /**
- * Unsigned test endpoint — doğrudan decoded notification payload kabul eder.
- * Sadece dev/debug için kullanılır. İmza doğrulamaz; ya decoded objesini ya da
- * already-normalized generic event'i kabul eder.
+ * Unsigned test endpoint — accepts decoded notification payloads or already-
+ * normalized events. Dev/debug only; bypasses JWS verification.
+ *
+ * If the payload contains a bundleId we recognize, the event is routed to that
+ * app. Otherwise we route to the default app so the local simulator keeps
+ * working without extra config.
  */
 webhook.post('/test', (req, res) => {
   try {
     const body = req.body || {};
 
-    // Mode 1: already-normalized event (dashboard'daki Webhook Debug testleri bunu gönderir)
+    // Allow callers to override the app explicitly.
+    const overrideAppId = body.app_id || req.query?.app_id || null;
+
+    // Mode 1: already-normalized event.
     if (body.type && body.app_user_id) {
-      const result = processEvent(body);
-      return res.json({ ok: true, duplicate: result.duplicate });
+      let appId = overrideAppId || body.app_id;
+      if (!appId) {
+        const fallback = resolveAppForBundleId(null, { strict: false });
+        appId = fallback?.id || null;
+      }
+      const result = processEvent({ ...body, app_id: appId });
+      return res.json({ ok: true, app_id: appId, duplicate: result.duplicate });
     }
 
-    // Mode 2: decoded Apple notification objesi (signedPayload olmadan)
+    // Mode 2: decoded Apple notification.
     if (body.notificationType) {
-      const internal = mapNotification(body);
+      const bundleId = body.data?.bundleId || null;
+      const app = overrideAppId
+        ? resolveAppForBundleId(null, { strict: false }) // overrideAppId path below
+        : resolveAppForBundleId(bundleId, { strict: false });
+      const targetApp = overrideAppId
+        ? (getApps().find(a => a.id === overrideAppId) || app)
+        : app;
+      if (!targetApp) {
+        return res.status(400).json({ error: 'no_app_resolved', bundle_id: bundleId });
+      }
+      const internal = mapNotification(body, { appId: targetApp.id });
       const results = internal.map(processEvent);
       return res.json({
         ok: true,
+        app_id: targetApp.id,
         notificationType: body.notificationType,
         subtype: body.subtype,
         processed: results.length,
@@ -122,11 +159,12 @@ webhook.post('/test', (req, res) => {
       });
     }
 
-    // Mode 3: signedPayload (verification bypass ile)
+    // Mode 3: signedPayload (verification bypass).
     if (body.signedPayload) {
       const out = handleAppleNotification(body.signedPayload, { verify: false });
       return res.json({
         ok: true,
+        app_id: out.app.id,
         notificationType: out.decoded.notificationType,
         subtype: out.decoded.subtype,
         processed: out.results.length,

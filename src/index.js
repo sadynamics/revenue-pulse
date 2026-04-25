@@ -11,6 +11,9 @@ import { webhook } from './routes/webhook.js';
 import { sse } from './routes/sse.js';
 import { startReconcileScheduler } from './services/reconcile.js';
 import './db.js';
+import { reloadApps, getApps } from './services/apps.js';
+
+reloadApps();
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
@@ -61,7 +64,13 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`\n  ⚡ Revenue Pulse ready at http://localhost:${PORT}`);
-  console.log(`  ⤷ Webhook:  POST /webhook`);
-  console.log(`  ⤷ Dashboard: /\n`);
+  console.log(`  ⤷ Webhook:   POST /webhook`);
+  console.log(`  ⤷ Dashboard: /`);
+  const apps = getApps();
+  if (apps.length === 0) {
+    console.log('  ⤷ Apps:      (none configured — set APPS_CONFIG or APPSTORE_* env vars)\n');
+  } else {
+    console.log(`  ⤷ Apps:      ${apps.map(a => `${a.id} (${a.bundle_id}, ${a.environment})`).join(', ')}\n`);
+  }
   startReconcileScheduler();
 });

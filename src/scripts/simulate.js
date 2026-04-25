@@ -18,6 +18,10 @@ const args = Object.fromEntries(
 
 const URL = args.url || `http://localhost:${process.env.PORT || 3000}`;
 const INTERVAL = parseInt(args.interval || '4000', 10);
+// Optional: target a specific app by id; the test endpoint will tag events
+// with this app_id. If unset, the server falls back to the default app.
+const APP_ID = args['app-id'] || args.app || process.env.SIMULATE_APP_ID || null;
+const BUNDLE_ID = args['bundle-id'] || args.bundle || process.env.SIMULATE_BUNDLE_ID || 'com.acme.app';
 
 const PRODUCTS = [
   { id: 'com.acme.pro.monthly',     price: 9990,  period: 'MONTHLY', days: 30, type: 'Auto-Renewable Subscription', group: 'pro' },
@@ -57,12 +61,13 @@ async function tick() {
     notificationUUID: uuid(),
     version: '2.0',
     signedDate: now,
-    data: { appAppleId: 1234567890, bundleId: 'com.acme.app', bundleVersion: '1.0', environment: 'Production' },
+    ...(APP_ID ? { app_id: APP_ID } : {}),
+    data: { appAppleId: 1234567890, bundleId: BUNDLE_ID, bundleVersion: '1.0', environment: 'Production' },
     transactionInfo: {
       transactionId: 'tx_' + Math.random().toString(36).slice(2, 14),
       originalTransactionId: originalTxId,
       webOrderLineItemId: String(Date.now()),
-      bundleId: 'com.acme.app',
+      bundleId: BUNDLE_ID,
       productId: product.id,
       subscriptionGroupIdentifier: product.group,
       purchaseDate: now,
@@ -92,7 +97,10 @@ async function tick() {
   };
 
   try {
-    const res = await fetch(`${URL}/webhook/test`, {
+    const url = APP_ID
+      ? `${URL}/webhook/test?app_id=${encodeURIComponent(APP_ID)}`
+      : `${URL}/webhook/test`;
+    const res = await fetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
@@ -105,6 +113,7 @@ async function tick() {
   }
 }
 
-console.log(`Simulating App Store notifications → ${URL}/webhook/test every ${INTERVAL}ms`);
+const appLabel = APP_ID ? `app=${APP_ID}` : 'default app';
+console.log(`Simulating App Store notifications → ${URL}/webhook/test every ${INTERVAL}ms (${appLabel}, bundleId=${BUNDLE_ID})`);
 setInterval(tick, INTERVAL);
 tick();

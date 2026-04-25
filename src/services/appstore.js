@@ -251,7 +251,7 @@ function storefrontToA2(storefront) {
  */
 
 /** notification (decoded) → bizim event modelimize map eder. Array döner. */
-export function mapNotification(decoded) {
+export function mapNotification(decoded, { appId = null } = {}) {
   const {
     notificationType, subtype, notificationUUID, signedDate,
     transactionInfo: tx, renewalInfo: ri, data,
@@ -280,6 +280,7 @@ export function mapNotification(decoded) {
 
   const base = {
     event_id: notificationUUID,
+    app_id: appId,
     type,
     subtype: subtype || null,
     app_user_id: appUserId,

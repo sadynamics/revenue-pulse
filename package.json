@@ -10,7 +10,9 @@
     "seed": "node src/scripts/seed.js",
     "simulate": "node src/scripts/simulate.js",
     "backfill": "node src/scripts/backfill.js",
-    "reconcile": "node src/scripts/reconcile.js"
+    "reconcile": "node src/scripts/reconcile.js",
+    "notify:test": "node src/scripts/notify-test.js",
+    "notify:digest": "node src/scripts/notify-digest.js"
   },
   "engines": {
     "node": "22.x"

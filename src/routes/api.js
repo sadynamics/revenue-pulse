@@ -24,6 +24,11 @@ import {
   isAppApiConfigured,
   publicApp,
 } from '../services/apps.js';
+import {
+  sendBootPing as notifySendPing,
+  sendDailyDigestNow as notifySendDigest,
+} from '../services/notify/index.js';
+import { configStatus as notifyTelegramStatus } from '../services/notify/telegram.js';
 
 export const api = Router();
 
@@ -355,6 +360,29 @@ api.get('/renewals', (req, res) => {
   `).all(...baseParams, limit, offset);
   const total = db.prepare(`SELECT COUNT(*) AS c FROM events WHERE type = 'RENEWAL' ${filter}`).get(...baseParams).c;
   res.json({ total, items: rows });
+});
+
+// ---- Notifications (push channel: Telegram) ----
+api.get('/notify/status', (req, res) => {
+  res.json({ telegram: notifyTelegramStatus() });
+});
+
+api.post('/notify/test', async (req, res) => {
+  try {
+    const result = await notifySendPing();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: 'notify_test_failed', message: err.message });
+  }
+});
+
+api.post('/notify/digest', async (req, res) => {
+  try {
+    await notifySendDigest();
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'notify_digest_failed', message: err.message });
+  }
 });
 
 api.get('/summary', (req, res) => {

@@ -31,6 +31,7 @@ Webhook'lar JWS olarak gelir, imzası doğrulanır, içindeki `signedTransaction
 - **🛠 Daily reconcile job** – Aktif kullanıcıları periyodik tarayıp kaçan `EXPIRATION` / `CANCELLATION` / `REFUND` event'lerini otomatik düzeltir
 - **🧪 Apple test notification trigger** – Dashboard'dan doğrudan App Store Server API `notifications/test` çağrısı (Sandbox/Production seçimi)
 - **📦 Multi-app desteği** – Aynı dashboard'dan birden fazla uygulamayı izleme. Webhook'lar `bundleId`'ye göre otomatik route edilir; UI üst barındaki **App** dropdown'undan filtre. Her app kendi App Store Server API credential'larını kullanır.
+- **📲 Telegram push bildirimleri** – Her ingest edilen event için telefonuna anlık mesaj (RevenueCat mobil uygulaması tarzında: bayrak emoji, ürün, fiyat, app, "1h ago", durum badge'i). Her gün belirlediğin saatte günlük net gelir + uygulama bazlı kırılım digest'i. Backfill/reconcile kaynaklı eski event'ler push'lanmaz, rate-limit'e takılmamak için iç queue ile gönderilir.
 
 ## Mimari
 
@@ -332,9 +333,56 @@ History endpoint'i tüm IAP tiplerini döner:
 | `GET  /api/upcoming-renewals`     | 7 gün içinde yenilenecekler |
 | `GET  /api/notifications`         | Son 50 bildirim |
 | `GET  /api/summary`               | Overview için toplu response |
+| `GET  /api/notify/status`         | Telegram bağlantısı aktif mi |
+| `POST /api/notify/test`           | Telegram'a test mesajı yolla |
+| `POST /api/notify/digest`         | Günlük digest'i hemen gönder |
 | `GET  /healthz`                   | Health check |
 
 > Read endpoint'lerinin tamamı (metrics, subscribers, events, daily, mrr-history, products, countries, stores, churn-reasons, top-subscribers, upcoming-renewals, notifications, summary, renewals) opsiyonel `?app_id=<id>` query parametresini kabul eder. Verilmezse tüm app'ler için agregate sonuç döner.
+
+## Telegram bildirimleri
+
+Her ingest edilen event için telefonuna anlık push gelir; ek olarak günlük gelir digest'i atılır. RevenueCat mobil uygulamasındakine benzer yapıda — bayrak + ürün + fiyat + app + "1h ago" + durum badge'i. Backfill / reconcile sırasında bulunan eski event'ler (default: 60 dakikadan eski) push'lanmaz, ekran kirletmez.
+
+### Kurulum (5 dakika)
+
+1. Telegram'da `@BotFather` → `/newbot` → bota isim ver → **token** al.
+2. Yarattığın bota Telegram'dan `/start` gönder (yoksa sana mesaj atamaz).
+3. Tarayıcıda aç: `https://api.telegram.org/bot<TOKEN>/getUpdates` → ilk gelen objedeki `chat.id`'i not et (kişi: pozitif, grup: negatif).
+4. Railway/`.env`'e ekle:
+
+   ```bash
+   TELEGRAM_BOT_TOKEN=123456789:AA...
+   TELEGRAM_CHAT_ID=987654321
+   ```
+
+5. Servisi yeniden başlat. Boot log'unda `[notify] Telegram enabled · types=...` satırını görmelisin.
+6. Test:
+
+   ```bash
+   curl -X POST https://<your-domain>/api/notify/test
+   # ya da:
+   npm run notify:test
+   ```
+
+### Konfigürasyon (opsiyonel)
+
+| Env | Default | Açıklama |
+|---|---|---|
+| `NOTIFY_EVENT_TYPES` | sensible default | Hangi event tipleri push'lansın (virgül ayraçlı, `*` = hepsi) |
+| `NOTIFY_MAX_EVENT_AGE_MINUTES` | `60` | Bu dakikadan eski event'ler push'lanmaz (backfill kalkanı) |
+| `NOTIFY_INCLUDE_SANDBOX` | `true` | Sandbox event'leri de gelsin mi |
+| `NOTIFY_SHOW_DAILY_TOTAL` | `true` | Her push'ın altına o günün net gelir özetini ekle |
+| `NOTIFY_DAILY_DIGEST_ENABLED` | `true` | Günlük özet aktif mi |
+| `NOTIFY_DAILY_DIGEST_UTC_HOUR` | `6` | Hangi UTC saatinde gönderilsin (0–23) |
+| `TELEGRAM_QUEUE_GAP_MS` | `350` | Mesajlar arası min boşluk (Telegram rate-limit) |
+
+### Manuel tetikleme
+
+```bash
+npm run notify:test     # bağlantı testi
+npm run notify:digest   # geçmiş günün digest'ini hemen yolla
+```
 
 ## Sınırlamalar / notlar
 

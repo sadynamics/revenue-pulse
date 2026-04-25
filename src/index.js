@@ -12,8 +12,10 @@ import { sse } from './routes/sse.js';
 import { startReconcileScheduler } from './services/reconcile.js';
 import './db.js';
 import { reloadApps, getApps } from './services/apps.js';
+import { startNotifyService } from './services/notify/index.js';
 
 reloadApps();
+startNotifyService();
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;

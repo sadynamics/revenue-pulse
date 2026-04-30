@@ -29,6 +29,7 @@ import {
   sendDailyDigestNow as notifySendDigest,
 } from '../services/notify/index.js';
 import { configStatus as notifyTelegramStatus } from '../services/notify/telegram.js';
+import { runReprice } from '../services/reprice.js';
 
 export const api = Router();
 
@@ -438,6 +439,22 @@ api.post('/notify/digest', async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: 'notify_digest_failed', message: err.message });
+  }
+});
+
+// ---- Admin: rebuild historical analytics (FX + rollups) ----
+api.post('/admin/reprice', (req, res) => {
+  const dryRun =
+    req.query?.dry_run === '1' ||
+    req.query?.dry_run === 'true' ||
+    req.body?.dry_run === true;
+  const appId = req.query?.app_id || req.body?.app_id || null;
+  try {
+    const result = runReprice({ dryRun, appId });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    const status = err.status || 500;
+    res.status(status).json({ error: 'reprice_failed', message: err.message });
   }
 });
 

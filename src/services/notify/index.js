@@ -77,9 +77,9 @@ function shouldNotify(event) {
   return true;
 }
 
-function todayNetUsdFor(appId) {
+function todayNetUsdFor(appId, env) {
   try {
-    const row = analytics.daily(1, appId || null)[0];
+    const row = analytics.daily(1, appId || null, env)[0];
     return row ? row.net_revenue : 0;
   } catch {
     return 0;
@@ -92,7 +92,12 @@ async function handleIngestedEvent({ event }) {
 
   const app = getAppById(event.app_id);
   const showTotal = readShowDailyTotal();
-  const dailyTotalUsd = showTotal ? todayNetUsdFor(event.app_id) : null;
+  // Match the running total to the event's own environment so a sandbox event
+  // shows sandbox total (not contaminated with production), and vice versa.
+  const eventEnv = (event.environment || '').toUpperCase() === 'SANDBOX'
+    ? 'sandbox'
+    : 'production';
+  const dailyTotalUsd = showTotal ? todayNetUsdFor(event.app_id, eventEnv) : null;
 
   const text = formatEventMessage({ event, app, dailyTotalUsd });
 
@@ -136,7 +141,9 @@ async function sendDigestForYesterday() {
 
   // analytics.daily(2)[0] is yesterday in UTC, [1] is today. We summarise
   // yesterday because the day is fully closed.
-  const days = analytics.daily(2);
+  // Pull `env=all` so the digest can render both production and sandbox
+  // breakdown columns; the formatter highlights the production figure.
+  const days = analytics.daily(2, null, 'all');
   const yesterday = days[0];
   if (!yesterday) return;
 
@@ -144,7 +151,8 @@ async function sendDigestForYesterday() {
   let byApp = null;
   if (apps.length > 1) {
     try {
-      const ba = analytics.dailyByApp(2);
+      // Production-only per-app so the digest reflects real revenue.
+      const ba = analytics.dailyByApp(2, 'production');
       byApp = ba?.rows?.[0]?.by_app || null;
     } catch {
       byApp = null;
@@ -230,7 +238,7 @@ export async function sendBootPing() {
   const lines = [
     '✅ <b>Revenue Pulse · Telegram bağlantısı aktif</b>',
     `Apps: <b>${apps.length}</b>${apps.length ? ` (${apps.map((a) => a.name).join(', ')})` : ''}`,
-    `Today (all): <b>${formatUsd(analytics.daily(1)[0]?.net_revenue || 0)}</b>`,
+    `Today (production): <b>${formatUsd(analytics.daily(1, null, 'production')[0]?.net_revenue || 0)}</b>`,
   ];
   await telegram.sendMessage(lines.join('\n'));
   return { ok: true };

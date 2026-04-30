@@ -58,29 +58,43 @@ const evBadge = (type) => {
 
 const STATE = {
   appId: localStorage.getItem('rp.app_id') || '', // '' means "all apps"
+  // Environment filter — defaults to production so sandbox transactions never
+  // leak into real revenue numbers. User can opt into sandbox / all via the
+  // top-bar selector; the choice is persisted across reloads.
+  env: (localStorage.getItem('rp.env') || 'production').toLowerCase(),
   apps: [],
 };
 
-/** Append the currently selected app_id (if any) to a path. */
-function withAppId(path) {
-  if (!STATE.appId) return path;
+/** Append app_id and env filters to a URL path. */
+function withFilters(path) {
+  const params = [];
+  if (STATE.appId) params.push(`app_id=${encodeURIComponent(STATE.appId)}`);
+  // 'production' is the server default — no need to send it explicitly, but
+  // we do anyway so the URL is self-documenting and SSR caches don't confuse
+  // requests with implicit defaults.
+  if (STATE.env) params.push(`env=${encodeURIComponent(STATE.env)}`);
+  if (!params.length) return path;
   const sep = path.includes('?') ? '&' : '?';
-  return `${path}${sep}app_id=${encodeURIComponent(STATE.appId)}`;
+  return `${path}${sep}${params.join('&')}`;
 }
 
 // API helpers
 async function api(path) {
-  const r = await fetch('/api' + withAppId(path));
+  const r = await fetch('/api' + withFilters(path));
   if (!r.ok) throw new Error(`API ${path} → ${r.status}`);
   return r.json();
 }
 
-/** POST helper that includes app_id both as query param and (for JSON bodies) in the body. */
+/** POST helper that includes app_id + env in both query and body. */
 async function apiPost(path, body = {}) {
   const finalBody = (body && typeof body === 'object' && !Array.isArray(body))
-    ? { ...(STATE.appId ? { app_id: STATE.appId } : {}), ...body }
+    ? {
+        ...(STATE.appId ? { app_id: STATE.appId } : {}),
+        ...(STATE.env ? { env: STATE.env } : {}),
+        ...body,
+      }
     : body;
-  const r = await fetch('/api' + withAppId(path), {
+  const r = await fetch('/api' + withFilters(path), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(finalBody),
@@ -111,6 +125,22 @@ async function loadApps() {
   } catch (err) {
     console.warn('Failed to load apps:', err.message);
   }
+
+  // Hydrate the env selector from persisted state.
+  const envSel = $('#env-select');
+  if (envSel) {
+    if (!['production', 'sandbox', 'all'].includes(STATE.env)) {
+      STATE.env = 'production';
+      localStorage.setItem('rp.env', 'production');
+    }
+    envSel.value = STATE.env;
+    applyEnvBodyClass();
+  }
+}
+
+/** Reflect current env selection on <body> so CSS can decorate accent badges. */
+function applyEnvBodyClass() {
+  document.body.dataset.env = STATE.env;
 }
 
 // Chart palette
@@ -136,15 +166,21 @@ async function renderOverview() {
   const summaryReq   = api('/summary');
   const notifsReq    = api('/notifications?limit=15');
   const breakdownReq = showPerApp
-    ? fetch('/api/daily-by-app?days=30').then(r => r.json()).catch(() => null)
+    ? fetch('/api' + withFilters('/daily-by-app?days=30')).then(r => r.json()).catch(() => null)
     : Promise.resolve(null);
   const [s, notifs, breakdown] = await Promise.all([summaryReq, notifsReq, breakdownReq]);
 
   const k = s.kpis;
+  const isAllEnv = STATE.env === 'all';
+  const isSandbox = STATE.env === 'sandbox';
+  // The prod/sandbox split is only meaningful when env='all' (otherwise the
+  // server already filtered everything to one side and the other column is 0).
   const prodNet30 = s.daily.reduce((sum, d) => sum + (d.production_net_revenue || 0), 0);
   const sandboxNet30 = s.daily.reduce((sum, d) => sum + (d.sandbox_net_revenue || 0), 0);
 
   $('#page').innerHTML = `
+    ${isSandbox ? envBanner('sandbox') : ''}
+    ${isAllEnv  ? envBanner('all') : ''}
     <!-- KPI grid -->
     <section class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4">
       ${kpiCard('MRR',              fmtMoney(k.mrr),      k.new_subs_growth_pct)}
@@ -161,10 +197,12 @@ async function renderOverview() {
       ${kpiCard('Net rev. 30d',     fmtMoney(k.net_revenue_30d))}
       ${kpiCard('Avg LTV',          fmtMoney(k.avg_ltv_usd))}
     </section>
-    <section class="grid grid-cols-2 md:grid-cols-4 gap-4">
-      ${kpiCard('Prod net 30d',     fmtMoney(prodNet30))}
-      ${kpiCard('Sandbox net 30d',  fmtMoney(sandboxNet30))}
-    </section>
+    ${isAllEnv ? `
+      <section class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        ${kpiCard('Prod net 30d',     fmtMoney(prodNet30))}
+        ${kpiCard('Sandbox net 30d',  fmtMoney(sandboxNet30))}
+      </section>
+    ` : ''}
 
     <!-- Charts -->
     <section class="grid grid-cols-1 xl:grid-cols-3 gap-6">
@@ -1107,6 +1145,35 @@ function kpiCard(label, value, delta) {
   return `<div class="kpi"><div class="kpi-label">${label}</div><div class="kpi-value">${value}</div>${deltaHtml}</div>`;
 }
 
+/**
+ * A pinned banner shown above charts/KPIs when the current env filter is
+ * not the default (production). Makes the "you're looking at fake data"
+ * status impossible to miss.
+ */
+function envBanner(mode) {
+  if (mode === 'sandbox') {
+    return `
+      <div class="rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 flex items-center gap-3 text-sm">
+        <span class="text-lg">🧪</span>
+        <div class="flex-1">
+          <div class="font-semibold text-amber-200">Sandbox mode</div>
+          <div class="text-amber-300/80 text-xs">All numbers below are <b>test transactions only</b>. Switch the Env selector to Production to see real revenue.</div>
+        </div>
+      </div>`;
+  }
+  if (mode === 'all') {
+    return `
+      <div class="rounded-xl border border-sky-500/40 bg-sky-500/10 px-4 py-3 flex items-center gap-3 text-sm">
+        <span class="text-lg">🔀</span>
+        <div class="flex-1">
+          <div class="font-semibold text-sky-200">Production + Sandbox combined</div>
+          <div class="text-sky-300/80 text-xs">Sandbox transactions are mixed in. Switch back to Production for clean revenue numbers.</div>
+        </div>
+      </div>`;
+  }
+  return '';
+}
+
 function statusBadge(status) {
   const map = {
     active:        'badge-ok',
@@ -1246,7 +1313,13 @@ function renderDailyBreakdown(daily, breakdown) {
 
 function setTitle(title, sub) {
   $('#page-title').textContent = title;
-  $('#page-sub').textContent = sub || '';
+  // Append a small env hint to the subtitle so non-overview pages also show
+  // which dataset the user is currently looking at.
+  const envHint =
+    STATE.env === 'sandbox' ? ' · 🧪 Sandbox'
+    : STATE.env === 'all'   ? ' · 🔀 Prod + Sandbox'
+    : '';
+  $('#page-sub').textContent = (sub || '') + envHint;
   $('#last-updated').textContent = 'updated ' + new Date().toLocaleTimeString();
 }
 
@@ -1276,7 +1349,10 @@ function renderNotifRow(n) {
 let _sse = null;
 function startSse() {
   if (_sse) { try { _sse.close(); } catch (_) {} _sse = null; }
-  const url = STATE.appId ? `/sse/stream?app_id=${encodeURIComponent(STATE.appId)}` : '/sse/stream';
+  const params = [];
+  if (STATE.appId) params.push(`app_id=${encodeURIComponent(STATE.appId)}`);
+  if (STATE.env) params.push(`env=${encodeURIComponent(STATE.env)}`);
+  const url = params.length ? `/sse/stream?${params.join('&')}` : '/sse/stream';
   const es = new EventSource(url);
   _sse = es;
   es.addEventListener('hello', () => {
@@ -1362,6 +1438,16 @@ $('#app-select')?.addEventListener('change', (e) => {
   STATE.appId = e.target.value || '';
   if (STATE.appId) localStorage.setItem('rp.app_id', STATE.appId);
   else localStorage.removeItem('rp.app_id');
+  startSse();
+  route();
+});
+
+// Environment selector — same effect (re-route + reconnect SSE).
+$('#env-select')?.addEventListener('change', (e) => {
+  const v = (e.target.value || 'production').toLowerCase();
+  STATE.env = ['production', 'sandbox', 'all'].includes(v) ? v : 'production';
+  localStorage.setItem('rp.env', STATE.env);
+  applyEnvBodyClass();
   startSse();
   route();
 });

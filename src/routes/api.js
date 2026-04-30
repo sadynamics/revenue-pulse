@@ -55,6 +55,29 @@ function requireApp(req, res) {
   return app;
 }
 
+/**
+ * Resolve which environment the request targets.
+ *  - 'production' (default — sandbox excluded)
+ *  - 'sandbox'
+ *  - 'all' (production + sandbox combined)
+ *
+ * Frontend passes `?env=` and the dashboard defaults to 'production' so
+ * Apple sandbox transactions never bleed into real-world revenue numbers.
+ */
+function pickEnv(req) {
+  const e = (req.query?.env || req.body?.env || '').toString().toLowerCase().trim();
+  if (e === 'sandbox') return 'sandbox';
+  if (e === 'all' || e === '*') return 'all';
+  return 'production';
+}
+
+/** Build a SQL fragment for raw event/notification/subscriber list endpoints. */
+function envSqlClause(env, columnExpr = 'environment') {
+  if (env === 'all') return { sql: '', value: null };
+  const target = env === 'sandbox' ? 'SANDBOX' : 'PRODUCTION';
+  return { sql: `${columnExpr} = ?`, value: target };
+}
+
 api.get('/apps', (req, res) => {
   res.json({
     apps: getApps().map(publicApp),
@@ -81,13 +104,13 @@ api.get('/config', (req, res) => {
 
 api.get('/metrics', (req, res) => {
   const app = pickApp(req);
-  res.json(analytics.kpis(app?.id || null));
+  res.json(analytics.kpis(app?.id || null, pickEnv(req)));
 });
 
 api.get('/daily', (req, res) => {
   const days = Math.min(365, Math.max(1, parseInt(req.query.days) || 30));
   const app = pickApp(req);
-  res.json(analytics.daily(days, app?.id || null));
+  res.json(analytics.daily(days, app?.id || null, pickEnv(req)));
 });
 
 /**
@@ -97,21 +120,21 @@ api.get('/daily', (req, res) => {
  */
 api.get('/daily-by-app', (req, res) => {
   const days = Math.min(365, Math.max(1, parseInt(req.query.days) || 30));
-  res.json(analytics.dailyByApp(days));
+  res.json(analytics.dailyByApp(days, pickEnv(req)));
 });
 
 api.get('/mrr-history', (req, res) => {
   const days = Math.min(365, Math.max(1, parseInt(req.query.days) || 30));
   const app = pickApp(req);
-  res.json(analytics.mrrHistory(days, app?.id || null));
+  res.json(analytics.mrrHistory(days, app?.id || null, pickEnv(req)));
 });
 
-api.get('/products', (req, res) => res.json(analytics.productBreakdown(pickApp(req)?.id || null)));
-api.get('/countries', (req, res) => res.json(analytics.countryBreakdown(pickApp(req)?.id || null)));
-api.get('/stores', (req, res) => res.json(analytics.storeBreakdown(pickApp(req)?.id || null)));
-api.get('/churn-reasons', (req, res) => res.json(analytics.churnReasons(90, pickApp(req)?.id || null)));
-api.get('/top-subscribers', (req, res) => res.json(analytics.topSubscribers(20, pickApp(req)?.id || null)));
-api.get('/upcoming-renewals', (req, res) => res.json(analytics.upcomingRenewals(168, pickApp(req)?.id || null)));
+api.get('/products', (req, res) => res.json(analytics.productBreakdown(pickApp(req)?.id || null, pickEnv(req))));
+api.get('/countries', (req, res) => res.json(analytics.countryBreakdown(pickApp(req)?.id || null, pickEnv(req))));
+api.get('/stores', (req, res) => res.json(analytics.storeBreakdown(pickApp(req)?.id || null, pickEnv(req))));
+api.get('/churn-reasons', (req, res) => res.json(analytics.churnReasons(90, pickApp(req)?.id || null, pickEnv(req))));
+api.get('/top-subscribers', (req, res) => res.json(analytics.topSubscribers(20, pickApp(req)?.id || null, pickEnv(req))));
+api.get('/upcoming-renewals', (req, res) => res.json(analytics.upcomingRenewals(168, pickApp(req)?.id || null, pickEnv(req))));
 
 api.get('/subscribers', (req, res) => {
   const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 50));
@@ -120,6 +143,7 @@ api.get('/subscribers', (req, res) => {
   const q = req.query.q;
   const product = req.query.product;
   const app = pickApp(req);
+  const env = pickEnv(req);
 
   const where = [];
   const params = {};
@@ -127,6 +151,10 @@ api.get('/subscribers', (req, res) => {
   if (status && status !== 'all') { where.push('status = @status'); params.status = status; }
   if (product) { where.push('current_product_id = @product'); params.product = product; }
   if (q) { where.push('(app_user_id LIKE @q OR original_app_user_id LIKE @q)'); params.q = `%${q}%`; }
+  if (env !== 'all') {
+    where.push('environment = @env');
+    params.env = env === 'sandbox' ? 'SANDBOX' : 'PRODUCTION';
+  }
 
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const total = db.prepare(`SELECT COUNT(*) AS c FROM subscribers ${whereSql}`).get(params).c;
@@ -303,12 +331,17 @@ api.get('/events', (req, res) => {
   const type = req.query.type;
   const product = req.query.product;
   const app = pickApp(req);
+  const env = pickEnv(req);
 
   const where = [];
   const params = {};
   if (app) { where.push('app_id = @app_id'); params.app_id = app.id; }
   if (type && type !== 'all') { where.push('type = @type'); params.type = type; }
   if (product) { where.push('product_id = @product'); params.product = product; }
+  if (env !== 'all') {
+    where.push('environment = @env');
+    params.env = env === 'sandbox' ? 'SANDBOX' : 'PRODUCTION';
+  }
 
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const total = db.prepare(`SELECT COUNT(*) AS c FROM events ${whereSql}`).get(params).c;
@@ -335,12 +368,26 @@ api.get('/events/:id', (req, res) => {
 api.get('/notifications', (req, res) => {
   const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 50));
   const app = pickApp(req);
-  const where = app ? `WHERE app_id = ?` : '';
-  const params = app ? [app.id, limit] : [limit];
+  const env = pickEnv(req);
+
+  // notifications.environment is not stored — derive via JOIN to events.
+  // For correctness of env filter we only filter rows that have an event_id;
+  // synthetic rows without an event_id (e.g. seeded webhook tests) bypass.
+  const conds = [];
+  const params = [];
+  if (app) { conds.push('n.app_id = ?'); params.push(app.id); }
+  if (env !== 'all') {
+    conds.push("(e.environment = ? OR (n.event_id IS NULL AND ? = 'PRODUCTION'))");
+    const target = env === 'sandbox' ? 'SANDBOX' : 'PRODUCTION';
+    params.push(target, target);
+  }
+  const whereSql = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const rows = db.prepare(`
-    SELECT * FROM notifications ${where}
-    ORDER BY created_at_ms DESC LIMIT ?
-  `).all(...params);
+    SELECT n.* FROM notifications n
+    LEFT JOIN events e ON e.id = n.event_id
+    ${whereSql}
+    ORDER BY n.created_at_ms DESC LIMIT ?
+  `).all(...params, limit);
   res.json(rows);
 });
 
@@ -349,16 +396,25 @@ api.get('/renewals', (req, res) => {
   const limit = Math.min(500, Math.max(1, parseInt(req.query.limit) || 100));
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
   const app = pickApp(req);
-  const filter = app ? `AND app_id = ?` : '';
-  const baseParams = app ? [app.id] : [];
+  const env = pickEnv(req);
+
+  const conds = ["type = 'RENEWAL'"];
+  const baseParams = [];
+  if (app) { conds.push('app_id = ?'); baseParams.push(app.id); }
+  if (env !== 'all') {
+    conds.push('environment = ?');
+    baseParams.push(env === 'sandbox' ? 'SANDBOX' : 'PRODUCTION');
+  }
+  const whereSql = `WHERE ${conds.join(' AND ')}`;
+
   const rows = db.prepare(`
     SELECT id, app_id, app_user_id, product_id, period_type, price, price_usd, currency, country_code,
            store, event_timestamp_ms, expiration_at_ms
-    FROM events WHERE type = 'RENEWAL' ${filter}
+    FROM events ${whereSql}
     ORDER BY event_timestamp_ms DESC
     LIMIT ? OFFSET ?
   `).all(...baseParams, limit, offset);
-  const total = db.prepare(`SELECT COUNT(*) AS c FROM events WHERE type = 'RENEWAL' ${filter}`).get(...baseParams).c;
+  const total = db.prepare(`SELECT COUNT(*) AS c FROM events ${whereSql}`).get(...baseParams).c;
   res.json({ total, items: rows });
 });
 
@@ -387,15 +443,17 @@ api.post('/notify/digest', async (req, res) => {
 
 api.get('/summary', (req, res) => {
   const appId = pickApp(req)?.id || null;
+  const env = pickEnv(req);
   res.json({
     app_id: appId,
-    kpis: analytics.kpis(appId),
-    daily: analytics.daily(30, appId),
-    mrr_history: analytics.mrrHistory(30, appId),
-    products: analytics.productBreakdown(appId).slice(0, 10),
-    countries: analytics.countryBreakdown(appId).slice(0, 10),
-    churn_reasons: analytics.churnReasons(90, appId).slice(0, 10),
-    top_subscribers: analytics.topSubscribers(10, appId),
-    upcoming_renewals: analytics.upcomingRenewals(168, appId).slice(0, 10),
+    environment: env,
+    kpis: analytics.kpis(appId, env),
+    daily: analytics.daily(30, appId, env),
+    mrr_history: analytics.mrrHistory(30, appId, env),
+    products: analytics.productBreakdown(appId, env).slice(0, 10),
+    countries: analytics.countryBreakdown(appId, env).slice(0, 10),
+    churn_reasons: analytics.churnReasons(90, appId, env).slice(0, 10),
+    top_subscribers: analytics.topSubscribers(10, appId, env),
+    upcoming_renewals: analytics.upcomingRenewals(168, appId, env).slice(0, 10),
   });
 });

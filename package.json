@@ -12,7 +12,8 @@
     "backfill": "node src/scripts/backfill.js",
     "reconcile": "node src/scripts/reconcile.js",
     "notify:test": "node src/scripts/notify-test.js",
-    "notify:digest": "node src/scripts/notify-digest.js"
+    "notify:digest": "node src/scripts/notify-digest.js",
+    "reprice": "node src/scripts/reprice.js"
   },
   "engines": {
     "node": "22.x"

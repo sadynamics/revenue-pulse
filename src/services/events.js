@@ -223,7 +223,16 @@ function applyEventToSubscriber(existing, ev) {
 
 function buildNotification(ev, eventRowId) {
   const user = (ev.app_user_id || '').slice(0, 10);
-  const priceFmt = ev.price_usd ? `$${ev.price_usd.toFixed(2)}` : '';
+  // Show USD when we have a rate, otherwise the local currency, so the body
+  // text never silently misleads (KZT 2990 used to render as "$2,990").
+  let priceFmt = '';
+  if (ev.price_usd != null && ev.price_usd !== 0) {
+    priceFmt = `$${Number(ev.price_usd).toFixed(2)}`;
+  } else if (ev.price && ev.currency && ev.currency !== 'USD') {
+    priceFmt = `${Number(ev.price).toFixed(2)} ${ev.currency}`;
+  } else if (ev.price) {
+    priceFmt = `$${Number(ev.price).toFixed(2)}`;
+  }
   const productFmt = ev.product_id ? ` · ${ev.product_id}` : '';
 
   const map = {

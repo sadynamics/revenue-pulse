@@ -66,6 +66,32 @@ export function formatUsd(n, { signed = false } = {}) {
   return v < 0 ? `-$${fmt}` : `$${fmt}`;
 }
 
+/** Symbols for currencies we don't have an FX rate for. Code if unknown. */
+const CURRENCY_SYMBOLS = {
+  USD: '$', EUR: '€', GBP: '£', JPY: '¥', CNY: '¥', KRW: '₩', INR: '₹',
+  TRY: '₺', RUB: '₽', BRL: 'R$', MXN: 'Mex$', PLN: 'zł', SEK: 'kr',
+  NOK: 'kr', DKK: 'kr', CHF: 'CHF', AUD: 'A$', CAD: 'C$', NZD: 'NZ$',
+  HKD: 'HK$', SGD: 'S$', TWD: 'NT$', THB: '฿', PHP: '₱', IDR: 'Rp',
+  VND: '₫', ZAR: 'R', AED: 'د.إ', SAR: '﷼', KZT: '₸', UAH: '₴',
+  ILS: '₪', NGN: '₦', EGP: 'E£', PKR: '₨', BDT: '৳', LKR: 'Rs',
+};
+
+/** Local currency major-unit amount → "₸2,990" / "₺99.99" / "990 KZT". */
+export function formatLocal(amount, currency) {
+  const v = Number(amount) || 0;
+  const code = (currency || '').toUpperCase();
+  const sym = CURRENCY_SYMBOLS[code];
+  // Currencies without subunits should not show decimals (JPY, KRW, IDR, …).
+  const noDecimals = ['JPY', 'KRW', 'CLP', 'VND', 'IDR', 'ISK', 'HUF', 'PYG', 'XAF', 'XOF'].includes(code);
+  const fmt = Math.abs(v).toLocaleString('en-US', {
+    minimumFractionDigits: noDecimals ? 0 : 2,
+    maximumFractionDigits: noDecimals ? 0 : 2,
+  });
+  const signed = v < 0 ? '-' : '';
+  if (sym) return `${signed}${sym}${fmt}`;
+  return `${signed}${fmt} ${code || ''}`.trim();
+}
+
 /**
  * Per-event-type display metadata. Keep short — the badge appears next to the
  * app name in the title row.
@@ -121,14 +147,30 @@ export function formatEventMessage({ event, app, dailyTotalUsd = null }) {
   const envIsSandbox = (event.environment || '').toUpperCase() === 'SANDBOX';
 
   const isLoss = meta.revenue === 'loss';
-  const amount = event.price_usd
-    ? formatUsd(isLoss ? -Math.abs(event.price_usd) : event.price_usd)
-    : '';
+  // Prefer the USD-converted amount; if the FX rate is unknown for this
+  // currency the conversion returns null, in which case we show the LOCAL
+  // currency value instead so the user still sees the real number (and not
+  // a misleading "$0" or worse, an unconverted local figure rendered as USD).
+  let amountChunk = '';
+  if (event.price_usd != null && event.price_usd !== 0) {
+    const usd = formatUsd(isLoss ? -Math.abs(event.price_usd) : event.price_usd);
+    amountChunk = `<code>${escapeHtml(usd)}</code>`;
+    if (event.currency && event.currency !== 'USD' && event.price) {
+      const local = formatLocal(event.price, event.currency);
+      amountChunk += ` <i>(${escapeHtml(local)})</i>`;
+    }
+  } else if (event.price && event.currency) {
+    const local = formatLocal(
+      isLoss ? -Math.abs(event.price) : event.price,
+      event.currency
+    );
+    amountChunk = `<code>${escapeHtml(local)}</code>`;
+  }
 
   const head = [
     flag || '🌐',
     `<b>${escapeHtml(product)}</b>`,
-    amount ? `<code>${escapeHtml(amount)}</code>` : '',
+    amountChunk,
     `· ${meta.emoji} <b>${escapeHtml(meta.badge)}</b>`,
   ]
     .filter(Boolean)

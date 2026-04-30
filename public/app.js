@@ -5,6 +5,38 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
 const fmtMoney = (n, d = 2) => '$' + (Number(n) || 0).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+
+// Currency symbol fallback for local-currency rendering (when we don't have
+// a USD FX rate for the storefront's currency, e.g. KZT, GEL, AMD).
+const CURRENCY_SYMBOLS = {
+  USD:'$',EUR:'€',GBP:'£',JPY:'¥',CNY:'¥',KRW:'₩',INR:'₹',TRY:'₺',
+  RUB:'₽',BRL:'R$',MXN:'Mex$',PLN:'zł',SEK:'kr',NOK:'kr',DKK:'kr',
+  CHF:'CHF',AUD:'A$',CAD:'C$',NZD:'NZ$',HKD:'HK$',SGD:'S$',TWD:'NT$',
+  THB:'฿',PHP:'₱',IDR:'Rp',VND:'₫',ZAR:'R',AED:'د.إ',SAR:'﷼',KZT:'₸',
+  UAH:'₴',ILS:'₪',NGN:'₦',EGP:'E£',PKR:'₨',BDT:'৳',LKR:'Rs',
+};
+const NO_DECIMAL_CCY = new Set(['JPY','KRW','CLP','VND','IDR','ISK','HUF','PYG','XAF','XOF']);
+
+/** Format a local-currency amount (when USD conversion is missing). */
+function fmtLocal(amount, currency) {
+  const v = Number(amount) || 0;
+  const code = (currency || '').toUpperCase();
+  const sym = CURRENCY_SYMBOLS[code];
+  const d = NO_DECIMAL_CCY.has(code) ? 0 : 2;
+  const fmt = Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+  const sign = v < 0 ? '-' : '';
+  return sym ? `${sign}${sym}${fmt}` : `${sign}${fmt} ${code}`;
+}
+
+/**
+ * Pick the best representation for a row's price: USD when known, otherwise
+ * local currency. Avoids showing "$2,990" for an unconverted KZT 2990.
+ */
+function fmtPriceRow(row) {
+  if (row && row.price_usd != null && row.price_usd !== 0) return fmtMoney(row.price_usd);
+  if (row && row.price && row.currency) return fmtLocal(row.price, row.currency);
+  return '—';
+}
 const fmtNum = (n) => (Number(n) || 0).toLocaleString('en-US');
 const fmtPct = (n, d = 1) => (n == null ? '—' : (Number(n).toFixed(d) + '%'));
 const fmtDate = (ms) => ms ? new Date(ms).toLocaleString() : '—';
@@ -414,7 +446,7 @@ function renderEventsTable({ total, items }) {
             <td>${e.period_type || '—'}</td>
             <td>${e.country_code || '—'}</td>
             <td>${e.store || '—'}</td>
-            <td class="text-right font-semibold">${e.price_usd ? fmtMoney(e.price_usd) : '—'}</td>
+            <td class="text-right font-semibold">${fmtPriceRow(e)}</td>
           </tr>`).join('')}
       </tbody>
     </table>
@@ -446,7 +478,7 @@ async function renderRenewals() {
               <td>${e.country_code || '—'}</td>
               <td>${e.store || '—'}</td>
               <td class="text-ink-400">${fmtDate(e.expiration_at_ms)}</td>
-              <td class="text-right font-semibold">${fmtMoney(e.price_usd)}</td>
+              <td class="text-right font-semibold">${fmtPriceRow(e)}</td>
             </tr>`).join('') || `<tr><td colspan="8">${emptyState('No renewals yet')}</td></tr>`}
         </tbody>
       </table>
@@ -967,7 +999,7 @@ async function openSubscriber(id) {
             <div class="flex items-center gap-2 flex-wrap">
               ${evBadge(e.type)}
               <span class="text-sm">${e.product_id || ''} ${e.period_type ? `· ${e.period_type}` : ''}</span>
-              ${e.price_usd ? `<span class="text-sm font-semibold">${fmtMoney(e.price_usd)}</span>` : ''}
+              ${(e.price_usd || e.price) ? `<span class="text-sm font-semibold">${fmtPriceRow(e)}</span>` : ''}
               <span class="text-xs text-ink-400 ml-auto">${fmtDate(e.event_timestamp_ms)}</span>
             </div>
             ${(e.cancel_reason || e.expiration_reason) ? `<div class="text-xs text-ink-400 mt-1">Reason: ${e.cancel_reason || e.expiration_reason}</div>` : ''}
